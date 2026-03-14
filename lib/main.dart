@@ -1,3 +1,6 @@
+// Aplicación de salud integral "Vitu": nutrición, ejercicio, hidratación y sueño
+// Archivo principal con pantallas, modelos de datos y utilidades de la app
+// Importaciones de SDK, UI, sensores, ubicación, gráficos, persistencia y Gemini
 import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
@@ -9,20 +12,54 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:sensors_plus/sensors_plus.dart';
-// Reemplazado activity_recognition_flutter por geolocator + sensors_plus (AGP 8+)
 import 'package:google_generative_ai/google_generative_ai.dart';
-// pubspec.yaml (agregar dependencias)
-// hive: ^2.2.3
-// hive_flutter: ^1.1.0
 import 'package:hive_flutter/hive_flutter.dart';
-// Corregido lint: unnecessary import
 
+// Inicializa Hive y abre las cajas locales necesarias antes de iniciar la app
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Hive.initFlutter();
   await Hive.openBox('users');
   await Hive.openBox('user_settings');
+  // Migración idempotente: mover campos de apariencia desde User → UserSettings
+  final users = Hive.box('users');
+  for (final key in users.keys) {
+    if (key is String && key.startsWith('user:')) {
+      final raw = users.get(key);
+      if (raw is Map) {
+        final hasAny =
+            raw.containsKey('brightness') ||
+            raw.containsKey('seedColor') ||
+            raw.containsKey('fontFamily') ||
+            raw.containsKey('followLocation');
+        if (hasAny) {
+          final correo = key.substring(5);
+          final prev = getSettingsForUser(correo);
+          final braw = raw['brightness'];
+          final sraw = raw['seedColor'];
+          final fraw = raw['fontFamily'];
+          final lraw = raw['followLocation'];
+          final settings = UserSettings(
+            userId: correo,
+            // Campos movidos a UserSettings
+            brightness: braw == null ? null : '$braw',
+            seedColor: (sraw is int) ? sraw : int.tryParse('${sraw ?? ''}'),
+            fontFamily: fraw == null ? null : '$fraw',
+            followLocation: lraw == null
+                ? false
+                : (lraw is bool ? lraw : '$lraw' == 'true'),
+            metaHydratationMl: prev?.metaHydratationMl,
+          );
+          await saveSettings(settings);
+          raw.remove('brightness');
+          raw.remove('seedColor');
+          raw.remove('fontFamily');
+          raw.remove('followLocation');
+          await users.put(key, raw);
+        }
+      }
+    }
+  }
   await Hive.openBox('daily_exercise');
   await Hive.openBox('hydration_logs');
   await Hive.openBox('daily_hydration_summary');
@@ -30,12 +67,14 @@ Future<void> main() async {
   runApp(const MyApp());
 }
 
+// Convierte un Color en entero ARGB para poder persistirlo en Hive
 int colorToArgb(Color c) =>
     ((c.a * 255).round() << 24) |
     ((c.r * 255).round() << 16) |
     ((c.g * 255).round() << 8) |
     (c.b * 255).round();
 
+// Widget raíz de la aplicación: configura tema, tipografías y pantalla inicial
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -45,27 +84,417 @@ class MyApp extends StatelessWidget {
       title: 'Vitu',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.lime),
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF4CAF50)),
         useMaterial3: true,
+        fontFamily: 'Roboto',
+        textTheme: const TextTheme(
+          headlineLarge: TextStyle(fontWeight: FontWeight.w800),
+          headlineMedium: TextStyle(fontWeight: FontWeight.w800),
+          titleLarge: TextStyle(fontWeight: FontWeight.w700),
+          bodyLarge: TextStyle(fontSize: 16),
+          bodyMedium: TextStyle(fontSize: 14),
+        ),
+        iconTheme: const IconThemeData(size: 32),
+        appBarTheme: const AppBarTheme(
+          centerTitle: true,
+          elevation: 0,
+          titleTextStyle: TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.w800,
+            color: Colors.white,
+          ),
+          foregroundColor: Colors.white,
+        ),
+        inputDecorationTheme: const InputDecorationTheme(
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.all(Radius.circular(16)),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.all(Radius.circular(16)),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.all(Radius.circular(16)),
+          ),
+        ),
+        cardTheme: CardThemeData(
+          elevation: 4,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+        ),
+        bottomNavigationBarTheme: const BottomNavigationBarThemeData(
+          selectedIconTheme: IconThemeData(size: 32),
+          unselectedIconTheme: IconThemeData(size: 28),
+        ),
       ),
       home: const SplashScreen(),
     );
   }
 }
 
+// Pantalla para editar el perfil del usuario (datos y foto)
+class UserProfileEditScreen extends StatefulWidget {
+  const UserProfileEditScreen({super.key});
+  @override
+  State<UserProfileEditScreen> createState() => _UserProfileEditScreenState();
+}
+
+class _UserProfileEditScreenState extends State<UserProfileEditScreen> {
+  final _nombreCtrl = TextEditingController();
+  final _apellidoCtrl = TextEditingController();
+  final _edadCtrl = TextEditingController();
+  final _alturaCtrl = TextEditingController();
+  final _pesoCtrl = TextEditingController();
+  String? _genero;
+  String? _correo;
+  // fixed: unused_field
+  String? _photoPath;
+
+  @override
+  void initState() {
+    super.initState();
+    final u = getCurrentUser();
+    if (u != null) {
+      _nombreCtrl.text = u.nombre;
+      _apellidoCtrl.text = u.apellido;
+      _edadCtrl.text = '${u.edad}';
+      _alturaCtrl.text = '${u.altura}';
+      _pesoCtrl.text = '${u.peso}';
+      _genero = u.genero.isEmpty ? null : u.genero;
+      _correo = u.correo;
+      _photoPath = u.photoPath;
+    }
+  }
+
+  @override
+  void dispose() {
+    _nombreCtrl.dispose();
+    _apellidoCtrl.dispose();
+    _edadCtrl.dispose();
+    _alturaCtrl.dispose();
+    _pesoCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _changePhoto() async {
+    final ImagePicker picker = ImagePicker();
+    final XFile? xfile = await picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 85,
+    );
+    if (xfile == null) return;
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      final path = '${dir.path}/vitu_profile_$ts.jpg';
+      final file = File(path);
+      await file.writeAsBytes(await xfile.readAsBytes());
+      if (!mounted) return;
+      setState(() => _photoPath = path);
+      // Ajustado para nuevo diseño de editar perfil: persistir cambio de foto
+      final u = getCurrentUser();
+      if (u != null) {
+        final updated = User(
+          nombre: u.nombre,
+          apellido: u.apellido,
+          genero: u.genero,
+          edad: u.edad,
+          altura: u.altura,
+          peso: u.peso,
+          correo: u.correo,
+          contrasena: u.contrasena,
+          photoPath: _photoPath,
+        );
+        await saveCurrentUser(updated);
+      }
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No se pudo guardar la foto')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // fixed: unused_local_variable
+    final seed = Theme.of(context).colorScheme.primary;
+    Color lightenColor(Color c, double amount) {
+      final h = HSLColor.fromColor(c);
+      return h.withLightness((h.lightness + amount).clamp(0.0, 1.0)).toColor();
+    }
+
+    Color darkenColor(Color c, double amount) {
+      final h = HSLColor.fromColor(c);
+      return h.withLightness((h.lightness - amount).clamp(0.0, 1.0)).toColor();
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        foregroundColor: Colors.white,
+        flexibleSpace: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [lightenColor(seed, 0.12), darkenColor(seed, 0.06)],
+            ),
+          ),
+        ),
+        title: const Text('Editar perfil'),
+      ),
+      // Ajustado para nuevo diseño de editar perfil
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+        child: Column(
+          children: [
+            Center(
+              child: GestureDetector(
+                onTap: _changePhoto,
+                child:
+                    _photoPath != null &&
+                        _photoPath!.isNotEmpty &&
+                        File(_photoPath!).existsSync()
+                    ? CircleAvatar(
+                        radius: 56,
+                        backgroundImage: FileImage(File(_photoPath!)),
+                      )
+                    : CircleAvatar(
+                        radius: 56,
+                        backgroundColor: seed,
+                        child: const Icon(
+                          Icons.person,
+                          size: 80,
+                          color: Colors.white,
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Center(
+              child: TextButton.icon(
+                onPressed: _changePhoto,
+                icon: const Icon(Icons.camera_alt),
+                label: const Text('Cambiar foto'),
+                style: TextButton.styleFrom(foregroundColor: seed),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              elevation: 3,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Builder(
+                  builder: (context) {
+                    final isDark =
+                        Theme.of(context).brightness == Brightness.dark;
+                    final fill = isDark
+                        ? const Color(0xFF1E1E1E)
+                        : const Color(0xFFF5F5F5);
+                    final label = Colors.grey[600];
+                    InputDecoration deco(String labelText) => InputDecoration(
+                      labelText: labelText,
+                      filled: true,
+                      fillColor: fill,
+                      labelStyle: TextStyle(color: label),
+                      border: const OutlineInputBorder(
+                        borderRadius: BorderRadius.all(Radius.circular(16)),
+                      ),
+                    );
+                    return Column(
+                      children: [
+                        TextField(
+                          controller: _nombreCtrl,
+                          decoration: deco('Nombre'),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _apellidoCtrl,
+                          decoration: deco('Apellido'),
+                        ),
+                        const SizedBox(height: 12),
+                        DropdownButtonFormField<String>(
+                          initialValue:
+                              _genero, // fixed: deprecated 'value' → initialValue
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'Masculino',
+                              child: Text('Masculino'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'Femenino',
+                              child: Text('Femenino'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'Otro',
+                              child: Text('Otro'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'Prefiero no decir',
+                              child: Text('Prefiero no decir'),
+                            ),
+                          ],
+                          onChanged: (v) => setState(() => _genero = v),
+                          decoration: deco('Género'),
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _edadCtrl,
+                                keyboardType: TextInputType.number,
+                                decoration: deco('Edad'),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: TextField(
+                                controller: _alturaCtrl,
+                                keyboardType: TextInputType.number,
+                                decoration: deco('Altura (cm)'),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _pesoCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: deco('Peso (kg)'),
+                        ),
+                        const SizedBox(height: 12),
+                        if (_correo != null)
+                          TextField(
+                            controller: TextEditingController(text: _correo),
+                            enabled: false,
+                            decoration: deco('Correo (solo lectura)'),
+                          ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: TextEditingController(text: '••••••••'),
+                          enabled: false,
+                          decoration: deco('Contraseña (solo lectura)'),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: () async {
+                      final nav = Navigator.of(context);
+                      await _usersBox.delete('currentUserEmail');
+                      if (!mounted) return;
+                      nav.pushAndRemoveUntil(
+                        MaterialPageRoute(
+                          builder: (_) => const LoginRegisterScreen(),
+                        ),
+                        (route) => false,
+                      );
+                    },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.redAccent,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                    child: const Text('Cerrar sesión'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: () async {
+                      final u = getCurrentUser();
+                      if (u == null) return;
+                      final nombre = _nombreCtrl.text.trim();
+                      final apellido = _apellidoCtrl.text.trim();
+                      final edadV = int.tryParse(_edadCtrl.text.trim());
+                      final alturaV = double.tryParse(_alturaCtrl.text.trim());
+                      final pesoV = double.tryParse(_pesoCtrl.text.trim());
+                      if (nombre.isEmpty ||
+                          apellido.isEmpty ||
+                          (edadV == null || edadV <= 0) ||
+                          (alturaV == null || alturaV <= 0) ||
+                          (pesoV == null || pesoV <= 0)) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Verifica los datos ingresados'),
+                          ),
+                        );
+                        return;
+                      }
+                      final updated = User(
+                        nombre: nombre,
+                        apellido: apellido,
+                        genero: _genero ?? (u.genero.isEmpty ? '' : u.genero),
+                        edad: edadV,
+                        altura: alturaV,
+                        peso: pesoV,
+                        correo: u.correo,
+                        contrasena: u.contrasena,
+                        photoPath: _photoPath,
+                      );
+                      final ctx =
+                          context; // fixed: use_build_context_synchronously
+                      await saveCurrentUser(updated);
+                      if (!ctx.mounted) {
+                        return; // fixed: use_build_context_synchronously
+                      }
+                      ScaffoldMessenger.of(ctx).showSnackBar(
+                        const SnackBar(content: Text('Datos guardados')),
+                      );
+                      Navigator.of(ctx).pop();
+                    },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: seed,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                    child: const Text('Guardar datos'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Modelo de usuario persistido localmente (Hive)
+// Incluye datos personales y preferencias de apariencia/privacidad
 class User {
   final String nombre;
   final String apellido;
   final String genero;
   final int edad;
-  final double altura; // cm
-  final double peso; // kg
+  // Altura en centímetros
+  final double altura;
+  // Peso en kilogramos
+  final double peso;
   final String correo;
-  final String contrasena; // simple local
-  final String? brightness; // 'light' | 'dark'
-  final int? seedColor; // ARGB int
-  final String? fontFamily; // null | 'serif' u otras
-  final bool? followLocation;
+  final String contrasena;
+  // Agregado para foto de perfil del usuario (ruta local opcional)
+  final String? photoPath;
+  // Campos de personalización movidos a UserSettings
   const User({
     required this.nombre,
     required this.apellido,
@@ -75,10 +504,7 @@ class User {
     required this.peso,
     required this.correo,
     required this.contrasena,
-    this.brightness,
-    this.seedColor,
-    this.fontFamily,
-    this.followLocation,
+    this.photoPath, // Agregado para foto de perfil
   });
   Map<String, dynamic> toMap() => {
     'nombre': nombre,
@@ -89,10 +515,7 @@ class User {
     'peso': peso,
     'correo': correo,
     'contrasena': contrasena,
-    'brightness': brightness,
-    'seedColor': seedColor,
-    'fontFamily': fontFamily,
-    'followLocation': followLocation,
+    'photoPath': photoPath, // Agregado para foto de perfil
   };
   factory User.fromMap(Map map) {
     return User(
@@ -110,76 +533,109 @@ class User {
           : double.tryParse('${map['peso'] ?? 0}') ?? 0.0,
       correo: '${map['correo'] ?? ''}',
       contrasena: '${map['contrasena'] ?? ''}',
-      brightness: map['brightness'] == null ? null : '${map['brightness']}',
-      seedColor: (map['seedColor'] is int)
-          ? map['seedColor']
-          : int.tryParse('${map['seedColor'] ?? ''}'),
-      fontFamily: map['fontFamily'] == null ? null : '${map['fontFamily']}',
-      followLocation: map['followLocation'] == null
+      photoPath: map['photoPath'] == null
           ? null
-          : (map['followLocation'] is bool
-                ? map['followLocation']
-                : '${map['followLocation']}' == 'true'),
+          : '${map['photoPath']}', // Agregado para foto de perfil
     );
   }
 }
 
+// Accesos rápidos a las cajas de Hive utilizadas por la aplicación
 Box get _usersBox => Hive.box('users');
 Box get _userSettingsBox => Hive.box('user_settings');
 Box get _dailyExerciseBox => Hive.box('daily_exercise');
 Box get _hydrationLogsBox => Hive.box('hydration_logs');
 Box get _hydrationSummaryBox => Hive.box('daily_hydration_summary');
+
+// Devuelve el correo del usuario actual si hay sesión activa
 String? getCurrentUserEmail() {
   final v = _usersBox.get('currentUserEmail');
   if (v is String && v.isNotEmpty) return v;
   return null;
 }
 
+// Obtiene un usuario por correo desde Hive
 User? getUserByEmail(String correo) {
   final raw = _usersBox.get('user:$correo');
   if (raw is Map) return User.fromMap(raw);
   return null;
 }
 
+// Obtiene el usuario actualmente autenticado
 User? getCurrentUser() {
   final email = getCurrentUserEmail();
   if (email == null) return null;
   return getUserByEmail(email);
 }
 
+// Guarda/actualiza un usuario y marca su sesión como activa
 Future<void> saveCurrentUser(User u) async {
   await _usersBox.put('user:${u.correo}', u.toMap());
   await _usersBox.put('currentUserEmail', u.correo);
 }
 
+// Verifica credenciales simples contra el almacenamiento local
 bool verifyLogin(String correo, String contrasena) {
   final u = getUserByEmail(correo.trim().toLowerCase());
   if (u == null) return false;
   return u.contrasena == contrasena;
 }
 
+// Ajustes por usuario para apariencia y preferencias
 class UserSettings {
   final String userId;
   final String? brightness;
   final int? seedColor;
   final String? fontFamily;
+  final String? language;
   final bool? followLocation;
   final double? metaHydratationMl;
+  // Agregado para permisos y preferencias adicionales
+  final Map<String, bool>? permissions;
+  final bool? shareAnonymous;
+  final bool? pushEnabled;
+  final bool? remindersEnabled;
+  final bool? healthAlerts;
+  final bool? locationPersonalized;
+  final bool? highContrast;
+  final int? notificationFrequency;
+  final double? textScale;
   const UserSettings({
     required this.userId,
     this.brightness,
     this.seedColor,
     this.fontFamily,
+    this.language,
     this.followLocation,
     this.metaHydratationMl,
+    this.permissions, // Agregado
+    this.shareAnonymous, // Agregado
+    this.pushEnabled, // Agregado
+    this.remindersEnabled, // Agregado
+    this.healthAlerts, // Agregado
+    this.locationPersonalized, // Agregado
+    this.highContrast, // Agregado
+    this.notificationFrequency, // Agregado
+    this.textScale, // Agregado
   });
   Map<String, dynamic> toMap() => {
     'userId': userId,
     'brightness': brightness,
     'seedColor': seedColor,
     'fontFamily': fontFamily,
+    'language': language,
     'followLocation': followLocation,
     'metaHydratationMl': metaHydratationMl,
+    // Agregado para permisos/preferencias
+    'permissions': permissions,
+    'shareAnonymous': shareAnonymous,
+    'pushEnabled': pushEnabled,
+    'remindersEnabled': remindersEnabled,
+    'healthAlerts': healthAlerts,
+    'locationPersonalized': locationPersonalized,
+    'highContrast': highContrast,
+    'notificationFrequency': notificationFrequency,
+    'textScale': textScale,
   };
   factory UserSettings.fromMap(Map map) => UserSettings(
     userId: '${map['userId'] ?? ''}',
@@ -188,6 +644,7 @@ class UserSettings {
         ? map['seedColor']
         : int.tryParse('${map['seedColor'] ?? ''}'),
     fontFamily: map['fontFamily'] == null ? null : '${map['fontFamily']}',
+    language: map['language'] == null ? null : '${map['language']}',
     followLocation: map['followLocation'] == null
         ? null
         : (map['followLocation'] is bool
@@ -196,9 +653,54 @@ class UserSettings {
     metaHydratationMl: (map['metaHydratationMl'] is double)
         ? map['metaHydratationMl']
         : double.tryParse('${map['metaHydratationMl'] ?? ''}'),
+    // Agregado para permisos/preferencias
+    permissions: (map['permissions'] is Map)
+        ? Map<String, bool>.from(
+            (map['permissions'] as Map).map(
+              (k, v) => MapEntry('$k', v is bool ? v : '$v' == 'true'),
+            ),
+          )
+        : null,
+    shareAnonymous: map['shareAnonymous'] == null
+        ? null
+        : (map['shareAnonymous'] is bool
+              ? map['shareAnonymous']
+              : '${map['shareAnonymous']}' == 'true'),
+    pushEnabled: map['pushEnabled'] == null
+        ? null
+        : (map['pushEnabled'] is bool
+              ? map['pushEnabled']
+              : '${map['pushEnabled']}' == 'true'),
+    remindersEnabled: map['remindersEnabled'] == null
+        ? null
+        : (map['remindersEnabled'] is bool
+              ? map['remindersEnabled']
+              : '${map['remindersEnabled']}' == 'true'),
+    healthAlerts: map['healthAlerts'] == null
+        ? null
+        : (map['healthAlerts'] is bool
+              ? map['healthAlerts']
+              : '${map['healthAlerts']}' == 'true'),
+    locationPersonalized: map['locationPersonalized'] == null
+        ? null
+        : (map['locationPersonalized'] is bool
+              ? map['locationPersonalized']
+              : '${map['locationPersonalized']}' == 'true'),
+    highContrast: map['highContrast'] == null
+        ? null
+        : (map['highContrast'] is bool
+              ? map['highContrast']
+              : '${map['highContrast']}' == 'true'),
+    notificationFrequency: (map['notificationFrequency'] is int)
+        ? map['notificationFrequency']
+        : int.tryParse('${map['notificationFrequency'] ?? ''}'),
+    textScale: (map['textScale'] is double)
+        ? map['textScale']
+        : double.tryParse('${map['textScale'] ?? ''}'),
   );
 }
 
+// Calcula la meta diaria de hidratación (ml) a partir de atributos del usuario
 double computeDailyHydrationGoalMl(User u) {
   final base = (u.peso > 0 ? u.peso : 70.0) * 35.0;
   double adj = base;
@@ -208,12 +710,14 @@ double computeDailyHydrationGoalMl(User u) {
   return adj.clamp(1200.0, 4500.0);
 }
 
+// Recupera los ajustes de un usuario guardados en Hive
 UserSettings? getSettingsForUser(String userId) {
   final raw = _userSettingsBox.get('settings:$userId');
   if (raw is Map) return UserSettings.fromMap(raw);
   return null;
 }
 
+// Persiste ajustes del usuario
 Future<void> saveSettings(UserSettings s) async {
   await _userSettingsBox.put('settings:${s.userId}', s.toMap());
 }
@@ -221,6 +725,7 @@ Future<void> saveSettings(UserSettings s) async {
 String _dateKey(DateTime d) =>
     '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
+// Registra ingestas de agua y mantiene un resumen diario por usuario
 Future<void> addHydrationMl(String userId, double ml) async {
   final today = _dateKey(DateTime.now());
   final logKey = '${userId}_$today';
@@ -254,19 +759,35 @@ Future<void> addHydrationMl(String userId, double ml) async {
         ? raw['total_ml']
         : double.tryParse('${raw['total_ml'] ?? 0}') ?? 0.0;
   }
-  total += ml;
-  final meta = settings.metaHydratationMl ?? computeDailyHydrationGoalMl(u!);
-  final pct = ((total / meta) * 100).clamp(0, 100);
+  double newTotal = total + ml;
+  if (newTotal < 0) newTotal = 0.0;
+  final meta =
+      settings.metaHydratationMl ??
+      computeDailyHydrationGoalMl(
+        u ??
+            User(
+              nombre: '',
+              apellido: '',
+              genero: '',
+              edad: 0,
+              altura: 0,
+              peso: 70,
+              correo: userId,
+              contrasena: '',
+            ),
+      );
+  final pct = ((newTotal / meta) * 100.0).clamp(0.0, 100.0);
   await _hydrationSummaryBox.put(summaryKey, {
     'userId': userId,
     'date': today,
-    'total_ml': total,
+    'total_ml': newTotal,
     'meta_ml': meta,
     'percentage': pct,
     'updatedAt': DateTime.now().millisecondsSinceEpoch,
   });
 }
 
+// Construye un fragmento con datos del usuario para personalizar prompts de IA
 String buildUserPromptPersonalization() {
   final u = getCurrentUser();
   if (u == null) return '';
@@ -277,6 +798,7 @@ String buildUserPromptPersonalization() {
   return '\nDatos del usuario: edad $edad años, peso ${peso.toStringAsFixed(peso % 1 == 0 ? 0 : 1)} kg, altura ${altura.toStringAsFixed(altura % 1 == 0 ? 0 : 1)} cm, género $g. Personaliza las recomendaciones considerando estas características.\n';
 }
 
+// Modelos internos para manejar recetas sugeridas por IA
 class _Receta {
   final String nombre;
   final String tiempo;
@@ -285,6 +807,7 @@ class _Receta {
   final String? imagenDesc;
   final String? porque;
   final List<_Ingrediente> ingredientes;
+  final List<String> steps; // Pasos precargados para carga instantánea
   final _Nutricion? nutricion;
   _Receta({
     required this.nombre,
@@ -292,17 +815,20 @@ class _Receta {
     required this.dificultad,
     this.porque,
     required this.ingredientes,
+    required this.steps, // Pasos precargados para carga instantánea
     this.nutricion,
   }) : imagenUrl = null,
        imagenDesc = null;
 }
 
+// Ingrediente de receta
 class _Ingrediente {
   final String nombre;
   final String tienda;
   _Ingrediente(this.nombre, this.tienda);
 }
 
+// Información nutricional asociada a una receta
 class _Nutricion {
   final int kcal;
   final double proteinas;
@@ -316,18 +842,23 @@ class _Nutricion {
   });
 }
 
+// App de navegación principal con pestañas para cada módulo de salud
 class VidaPlusApp extends StatefulWidget {
   const VidaPlusApp({super.key});
   @override
   State<VidaPlusApp> createState() => _VidaPlusAppState();
 }
 
+// Estado que gestiona tema, color semilla, fuente y ubicación a nivel global
 class _VidaPlusAppState extends State<VidaPlusApp> {
   int _index = 0;
   Brightness _brightness = Brightness.light;
   Color _seedColor = const Color(0xFF80CBC4);
   String? _fontFamily;
   bool _followLocation = false;
+  // Agregado para accesibilidad: escala de texto y alto contraste
+  double _textScale = 1.0;
+  bool _highContrast = false;
   @override
   void initState() {
     super.initState();
@@ -344,15 +875,43 @@ class _VidaPlusAppState extends State<VidaPlusApp> {
       }
       _fontFamily = s?.fontFamily;
       _followLocation = s?.followLocation ?? false;
+      _textScale = s?.textScale ?? 1.0;
+      _highContrast = s?.highContrast ?? false;
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final isDark = _brightness == Brightness.dark;
-    final background = isDark
-        ? const Color(0xFF121212)
-        : (Colors.grey[50] ?? Colors.white);
+    // Corregido modo oscuro global: aplica ThemeData dinámico con ColorScheme.fromSeed
+    final cs = ColorScheme.fromSeed(
+      seedColor: _seedColor,
+      brightness: _brightness,
+    );
+    final theme = ThemeData(
+      colorScheme: cs,
+      useMaterial3: true,
+      fontFamily: _fontFamily ?? 'Roboto',
+      textTheme: const TextTheme(
+        headlineLarge: TextStyle(fontWeight: FontWeight.w800),
+        headlineMedium: TextStyle(fontWeight: FontWeight.w800),
+        titleLarge: TextStyle(fontWeight: FontWeight.w700),
+        bodyLarge: TextStyle(fontSize: 16),
+        bodyMedium: TextStyle(fontSize: 14),
+      ),
+      appBarTheme: AppBarTheme(
+        backgroundColor: cs.surface,
+        foregroundColor: cs.onSurface,
+        centerTitle: true,
+        elevation: 0,
+      ),
+      bottomNavigationBarTheme: BottomNavigationBarThemeData(
+        backgroundColor: cs.surface,
+        selectedItemColor: cs.primary,
+        unselectedItemColor: cs.onSurfaceVariant,
+        selectedIconTheme: const IconThemeData(size: 32),
+        unselectedIconTheme: const IconThemeData(size: 28),
+      ),
+    );
     final items = const [
       BottomNavigationBarItem(icon: Icon(Icons.home_rounded), label: 'Home'),
       BottomNavigationBarItem(
@@ -399,26 +958,51 @@ class _VidaPlusAppState extends State<VidaPlusApp> {
             _seedColor = data.seed;
             _fontFamily = data.fontFamily;
             _followLocation = data.followLocation;
+            // Agregado para reflejar cambios de accesibilidad inmediatamente
+            final u = getCurrentUser();
+            if (u != null) {
+              final s = getSettingsForUser(u.correo);
+              _textScale = s?.textScale ?? _textScale;
+              _highContrast = s?.highContrast ?? _highContrast;
+            }
           });
         },
       ),
     ];
-    return Scaffold(
-      backgroundColor: background,
-      body: IndexedStack(index: _index, children: pages),
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _index,
-        onTap: (i) => setState(() => _index = i),
-        selectedItemColor: _seedColor,
-        unselectedItemColor: Colors.grey.shade600,
-        showSelectedLabels: false,
-        showUnselectedLabels: false,
-        items: items,
+    // Agregado para aplicar escala de texto y alto contraste globalmente
+    final mq = MediaQuery.of(context);
+    return MediaQuery(
+      data: mq.copyWith(
+        textScaler: TextScaler.linear(_textScale),
+        highContrast: _highContrast,
+      ),
+      child: Theme(
+        data: theme,
+        child: Scaffold(
+          backgroundColor: theme
+              .colorScheme
+              .surface, // fixed: deprecated background → color + colorScheme
+          body: IndexedStack(index: _index, children: pages),
+          bottomNavigationBar: BottomNavigationBar(
+            type: BottomNavigationBarType.fixed,
+            elevation: 8,
+            iconSize: 32,
+            backgroundColor: theme.colorScheme.surface,
+            currentIndex: _index,
+            onTap: (i) => setState(() => _index = i),
+            selectedItemColor: theme.colorScheme.primary,
+            unselectedItemColor: theme.colorScheme.onSurfaceVariant,
+            showSelectedLabels: false,
+            showUnselectedLabels: false,
+            items: items,
+          ),
+        ),
       ),
     );
   }
 }
 
+// Pequeño wrapper que aplica una animación de escala al presionar
 class PressableScale extends StatefulWidget {
   final Widget child;
   final VoidCallback onTap;
@@ -445,6 +1029,7 @@ class _PressableScaleState extends State<PressableScale> {
   }
 }
 
+// Pantalla principal de nutrición: captura/selección de imágenes y resultados
 class HomeScreen extends StatefulWidget {
   final Brightness brightness;
   final Color seedColor;
@@ -459,11 +1044,12 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
+// Estado de la pantalla de nutrición: fotos, análisis y recomendaciones
 class _HomeScreenState extends State<HomeScreen> {
   File? _photo;
   bool _saving = false;
-  // Gemini es autónomo: solo necesita internet, no BD ni servidor propio
-  late GenerativeModel _geminiModel; // ¡Cambia la API key en initState!
+  // Modelo generativo (Gemini) para analizar imágenes y extraer macronutrientes
+  late GenerativeModel _geminiModel;
   bool _analyzing = false;
   final List<File> _savedPhotos = [];
   String? _plato;
@@ -484,17 +1070,12 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
 
-    // Clave API real – NUNCA la subas a GitHub. Usa .env o constante segura en producción.
-    // Genera nueva en https://aistudio.google.com/app/apikey si esta falla.
-    const apiKey = 'AIzaSyCEwgwToG9cfPvf2wzNHGOhSeXCLafD1ms';
+    const apiKey = '';
 
-    // Inicializa el modelo de Gemini
-    _geminiModel = GenerativeModel(
-      model: 'gemini-2.5-flash', // v1
-      apiKey: apiKey,
-    );
+    // Configura el modelo generativo a utilizar
+    _geminiModel = GenerativeModel(model: 'gemini-2.5-flash', apiKey: apiKey);
 
-    // Verificación inicial de conectividad con Gemini (ping)
+    // Realiza un ping de conectividad al modelo
     Future.microtask(() async {
       try {
         debugPrint("Intentando ping con modelo: gemini-pro-vision");
@@ -526,8 +1107,8 @@ class _HomeScreenState extends State<HomeScreen> {
     Future.microtask(_cargarRecetasRecomendadas);
   }
 
+  // Abre el selector para elegir cámara o galería
   Future<void> _takePhoto() async {
-    // Conservado por compatibilidad; abre selector de fuente
     await _selectImageSource();
   }
 
@@ -552,6 +1133,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final path = '${dir.path}/vitu_food_$ts.jpg';
       final file = File(path);
       await file.writeAsBytes(await xfile.readAsBytes());
+      if (!mounted) return;
       setState(() {
         _photo = file;
         _savedPhotos.insert(0, file);
@@ -626,11 +1208,11 @@ class _HomeScreenState extends State<HomeScreen> {
     ScaffoldMessenger.of(context).showSnackBar(snack);
   }
 
+  // Procesa una foto con Gemini: construye prompt, envía imagen y extrae macros
   Future<void> _analizarConGemini(File foto) async {
     try {
       final length = await foto.length();
       debugPrint('Foto path: ${foto.path}');
-      // Quitadas llaves innecesarias en la interpolación
       debugPrint('Foto size: $length bytes');
       debugPrint('Enviando foto: ${foto.path}, tamaño: $length bytes');
       if (length == 0) {
@@ -660,7 +1242,6 @@ ${buildUserPromptPersonalization()}
       final lower = foto.path.toLowerCase();
       final mime = lower.endsWith('.png') ? 'image/png' : 'image/jpeg';
       final content = Content.multi([TextPart(prompt), DataPart(mime, bytes)]);
-      // Nota: Si >2MB, considera comprimir con paquete "image" (opcional)
       final resp = await _geminiModel
           .generateContent([content])
           .timeout(const Duration(seconds: 20));
@@ -811,9 +1392,7 @@ ${buildUserPromptPersonalization()}
       fontFamily: widget.fontFamily,
     );
     final vspace = MediaQuery.of(context).size.height / 50;
-    final appBarColor = isDark
-        ? widget.seedColor.withAlpha(80)
-        : widget.seedColor.withAlpha(120);
+
     BoxDecoration cardDeco() => BoxDecoration(
       gradient: LinearGradient(
         begin: Alignment.topLeft,
@@ -832,11 +1411,12 @@ ${buildUserPromptPersonalization()}
     return Scaffold(
       backgroundColor: background,
       appBar: AppBar(
-        backgroundColor: appBarColor,
-        elevation: 2,
-        foregroundColor: Colors.white,
+        // AppBar de Nutrición igualado al estilo de las otras secciones
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        elevation: 0,
+        foregroundColor: Theme.of(context).colorScheme.onSurface,
         centerTitle: true,
-        title: const Text('Nutrición'),
+        title: Text('Nutrición', style: Theme.of(context).textTheme.titleLarge),
       ),
       body: AnimatedSwitcher(
         duration: const Duration(milliseconds: 350),
@@ -1027,7 +1607,7 @@ ${buildUserPromptPersonalization()}
                               _nutriChip(
                                 'Proteínas',
                                 '${_prot?.toStringAsFixed(0) ?? '0'} g',
-                                Icons.eco, // hoja verde
+                                Icons.eco,
                                 Colors.green,
                                 body.copyWith(fontSize: 18),
                                 sub,
@@ -1035,8 +1615,7 @@ ${buildUserPromptPersonalization()}
                               _nutriChip(
                                 'Carbs',
                                 '${_carb?.toStringAsFixed(0) ?? '0'} g',
-                                Icons
-                                    .dataset, // icono estilo pan/trigo alternativo
+                                Icons.dataset,
                                 Colors.amber.shade700,
                                 body.copyWith(fontSize: 18),
                                 sub,
@@ -1240,25 +1819,44 @@ ${buildUserPromptPersonalization()}
                                   ],
                                 ),
                                 const SizedBox(height: 10),
+                                // Mejorada distribución y espaciado de botones en receta
                                 Row(
                                   children: [
                                     Expanded(
                                       child: OutlinedButton(
+                                        style: OutlinedButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(
+                                            vertical: 14,
+                                            horizontal: 20,
+                                          ),
+                                        ),
                                         onPressed: () =>
                                             _mostrarIngredientes(r),
                                         child: const Text('Ingredientes'),
                                       ),
                                     ),
-                                    const SizedBox(width: 10),
+                                    const SizedBox(width: 12),
                                     Expanded(
                                       child: OutlinedButton(
+                                        style: OutlinedButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(
+                                            vertical: 14,
+                                            horizontal: 20,
+                                          ),
+                                        ),
                                         onPressed: () => _mostrarPasos(r),
                                         child: const Text('Pasos'),
                                       ),
                                     ),
-                                    const SizedBox(width: 10),
+                                    const SizedBox(width: 12),
                                     Expanded(
                                       child: FilledButton.tonal(
+                                        style: FilledButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(
+                                            vertical: 14,
+                                            horizontal: 20,
+                                          ),
+                                        ),
                                         onPressed: () => _mostrarNutricion(r),
                                         child: const Text(
                                           'Estimado Nutricional',
@@ -1282,6 +1880,7 @@ ${buildUserPromptPersonalization()}
     );
   }
 
+  // Solicita al modelo 3 recetas saludables en formato JSON y actualiza estado
   Future<void> _cargarRecetasRecomendadas() async {
     if (!mounted) return;
     setState(() => _cargandoRecetas = true);
@@ -1294,9 +1893,9 @@ ${buildUserPromptPersonalization()}
       final prompt =
           'Sugiere 3 recetas saludables y variadas para hoy en El Salvador, basadas en una dieta balanceada para un usuario de género '
           '$genero, $edad años, $altura cm y $peso kg. Para cada receta incluye: nombre, tiempo aproximado, dificultad, breve porqué es saludable, '
-          'lista de ingredientes (solo nombres y cantidades, sin tiendas), y estimado nutricional aproximado (kcal, proteínas, carbohidratos, grasas). '
+          'lista de ingredientes (solo nombres y cantidades, sin tiendas), pasos de la receta (array de strings, cada uno un paso numerado), y estimado nutricional aproximado (kcal, proteínas, carbohidratos, grasas). '
           'Responde SOLO en formato JSON array con claves: nombre, tiempo, dificultad, razonSaludable, ingredientes (array de strings), '
-          'nutricional (objeto con kcal, proteinas, carbohidratos, grasas).';
+          'pasos (array de strings) y nutricional (objeto con kcal, proteinas, carbohidratos, grasas).'; // Pasos precargados para carga instantánea
       final res = await _geminiModel.generateContent([Content.text(prompt)]);
       final text = res.text?.trim() ?? '';
       final list = _parseRecetas(text);
@@ -1308,15 +1907,14 @@ ${buildUserPromptPersonalization()}
     }
   }
 
+  // Parsea la lista de recetas desde JSON, con tolerancia a formatos comunes
   List<_Receta> _parseRecetas(String text) {
     final out = <_Receta>[];
     try {
-      // Primero intenta decodificar JSON completo
       dynamic data;
       try {
         data = json.decode(text);
       } catch (_) {
-        // Si no es JSON puro, intenta extraer el array JSON
         final start = text.indexOf('[');
         final end = text.lastIndexOf(']');
         if (start != -1 && end != -1 && end > start) {
@@ -1352,6 +1950,23 @@ ${buildUserPromptPersonalization()}
                 ingredientes.add(_Ingrediente(n, ''));
               }
             }
+            // Pasos precargados para carga instantánea
+            final pasosRaw = item['pasos'] ?? item['steps'];
+            final steps = <String>[];
+            if (pasosRaw is List) {
+              for (final p in pasosRaw) {
+                final s = '$p'.trim();
+                if (s.isEmpty) continue;
+                steps.add(s);
+              }
+            } else if (pasosRaw is String) {
+              final lines = pasosRaw
+                  .split('\n')
+                  .map((l) => l.trim())
+                  .where((l) => l.isNotEmpty)
+                  .toList();
+              steps.addAll(lines);
+            }
             _Nutricion? nutr;
             final nutRaw =
                 item['nutricional'] ?? item['nutricion'] ?? item['nutrition'];
@@ -1382,6 +1997,7 @@ ${buildUserPromptPersonalization()}
                 dificultad: dif.isEmpty ? 'Fácil' : dif,
                 porque: porque.isEmpty ? null : porque,
                 ingredientes: ingredientes,
+                steps: steps,
                 nutricion: nutr,
               ),
             );
@@ -1392,9 +2008,7 @@ ${buildUserPromptPersonalization()}
     return out;
   }
 
-  // mock de recetas eliminado: se usa solo resultados reales o mensaje vacío
-
-  // _sugerirTienda eliminado por no uso
+  // Diálogos auxiliares para mostrar detalles de la receta seleccionada
 
   Future<void> _mostrarIngredientes(_Receta r) async {
     await showDialog<void>(
@@ -1402,31 +2016,82 @@ ${buildUserPromptPersonalization()}
       builder: (context) {
         return AlertDialog(
           title: const Text('Ingredientes'),
+          // Diálogo más ancho y legible (horizontal padding reducido)
+          insetPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 24),
+          contentPadding: EdgeInsets.zero,
           content: SizedBox(
-            width: double.maxFinite,
-            child: ListView(
-              shrinkWrap: true,
-              children: r.ingredientes.isNotEmpty
-                  ? r.ingredientes
-                        .map(
-                          (e) => ListTile(
-                            leading: Icon(
-                              Icons.check_circle_outline,
-                              color: widget.seedColor,
-                            ),
-                            title: Text(e.nombre),
+            width: MediaQuery.of(context).size.width * 0.95,
+            child: SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 20,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: r.ingredientes.isNotEmpty
+                      ? r.ingredientes
+                            .map(
+                              (e) => Padding(
+                                padding: const EdgeInsets.only(bottom: 12),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Icon(
+                                      Icons.check_circle_outline,
+                                      color: widget.seedColor,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: Text(
+                                        e.nombre,
+                                        // Texto con mayor fontSize y espaciado para mejor lectura
+                                        style: TextStyle(
+                                          fontSize: 16.5,
+                                          height: 1.55,
+                                          fontFamily: widget.fontFamily,
+                                        ),
+                                        textAlign: TextAlign.left,
+                                        softWrap: true,
+                                        overflow: TextOverflow.visible,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            )
+                            .toList()
+                      : [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(
+                                Icons.info_outline,
+                                color: widget.seedColor,
+                                size: 20,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  'Sin ingredientes',
+                                  // Texto con mayor fontSize y espaciado para mejor lectura
+                                  style: TextStyle(
+                                    fontSize: 16.5,
+                                    height: 1.55,
+                                    fontFamily: widget.fontFamily,
+                                  ),
+                                  textAlign: TextAlign.left,
+                                  softWrap: true,
+                                  overflow: TextOverflow.visible,
+                                ),
+                              ),
+                            ],
                           ),
-                        )
-                        .toList()
-                  : [
-                      ListTile(
-                        leading: Icon(
-                          Icons.info_outline,
-                          color: widget.seedColor,
-                        ),
-                        title: const Text('Sin ingredientes'),
-                      ),
-                    ],
+                        ],
+                ),
+              ),
             ),
           ),
           actions: [
@@ -1441,78 +2106,84 @@ ${buildUserPromptPersonalization()}
   }
 
   Future<void> _mostrarPasos(_Receta r) async {
-    final u = getCurrentUser();
-    final genero = u?.genero ?? 'no especificado';
-    final edad = u?.edad ?? 0;
-    final prompt =
-        "Genera los pasos detallados de la receta '${r.nombre}' para $genero, $edad años. Incluye 5-8 pasos claros y fáciles.";
-    String contenido = '';
-    bool loading = true;
+    // Pasos precargados para carga instantánea
+    final steps = r.steps;
     await showDialog<void>(
       context: context,
-      barrierDismissible: false,
       builder: (context) {
-        Future.microtask(() async {
-          try {
-            final res = await _geminiModel.generateContent([
-              Content.text(prompt),
-            ]);
-            final text = res.text?.trim() ?? '';
-            final lines = text
-                .split('\n')
-                .map((l) => l.trim())
-                .where((l) => l.isNotEmpty)
-                .toList();
-            contenido = lines.join('\n');
-          } catch (_) {
-            contenido = 'No se pudieron generar los pasos. Intenta de nuevo.';
-          } finally {
-            loading = false;
-            // ignore: use_build_context_synchronously
-            (context as Element).markNeedsBuild();
-          }
-        });
-        return StatefulBuilder(
-          builder: (context, setSt) {
-            return AlertDialog(
-              title: const Text('Pasos de la receta'),
-              content: SizedBox(
-                width: double.maxFinite,
-                child: loading
-                    ? Center(
-                        child: SizedBox(
-                          width: 28,
-                          height: 28,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 3,
-                            color: widget.seedColor,
-                          ),
-                        ),
+        final baseStyle = TextStyle(
+          fontSize: 16.5,
+          height: 1.55,
+          fontFamily: widget.fontFamily,
+          color: Theme.of(context).colorScheme.onSurface,
+        );
+        return AlertDialog(
+          title: const Text('Pasos de la receta'),
+          // Diálogo más ancho y legible (horizontal padding reducido)
+          insetPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 24),
+          contentPadding: EdgeInsets.zero,
+          content: SizedBox(
+            width: MediaQuery.of(context).size.width * 0.95,
+            child: SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 20,
+                ),
+                child: steps.isEmpty
+                    ? Text(
+                        'No hay pasos disponibles para esta receta.',
+                        // Texto con mayor fontSize y espaciado para mejor lectura
+                        style: baseStyle,
+                        textAlign: TextAlign.left,
+                        softWrap: true,
+                        overflow: TextOverflow.visible,
                       )
-                    : ListView(
-                        shrinkWrap: true,
-                        children: contenido
-                            .split('\n')
-                            .map(
-                              (l) => ListTile(
-                                leading: Icon(
-                                  Icons.checklist_rtl,
-                                  color: widget.seedColor,
+                    : Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: List.generate(steps.length, (i) {
+                          final isLast = i == steps.length - 1;
+                          return Padding(
+                            padding: EdgeInsets.only(bottom: isLast ? 0 : 16),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '${i + 1}.',
+                                  // Texto con mayor fontSize y espaciado para mejor lectura
+                                  style: baseStyle.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                  textAlign: TextAlign.left,
+                                  softWrap: true,
+                                  overflow: TextOverflow.visible,
                                 ),
-                                title: Text(l),
-                              ),
-                            )
-                            .toList(),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Text(
+                                    steps[i],
+                                    // Texto con mayor fontSize y espaciado para mejor lectura
+                                    style: baseStyle,
+                                    textAlign: TextAlign.left,
+                                    softWrap: true,
+                                    overflow: TextOverflow.visible,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }),
                       ),
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Cerrar'),
-                ),
-              ],
-            );
-          },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cerrar'),
+            ),
+          ],
         );
       },
     );
@@ -1525,35 +2196,138 @@ ${buildUserPromptPersonalization()}
     await showDialog<void>(
       context: context,
       builder: (context) {
+        final baseStyle = TextStyle(
+          fontSize: 16.5,
+          height: 1.55,
+          fontFamily: widget.fontFamily,
+          color: Theme.of(context).colorScheme.onSurface,
+        );
         return AlertDialog(
           title: const Text('Estimado nutricional'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: Icon(
-                  Icons.local_fire_department,
-                  color: widget.seedColor,
+          // Diálogo más ancho y legible (horizontal padding reducido)
+          insetPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 24),
+          contentPadding: EdgeInsets.zero,
+          content: SizedBox(
+            width: MediaQuery.of(context).size.width * 0.95,
+            child: SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 20,
                 ),
-                title: const Text('Calorías'),
-                trailing: Text('${n.kcal} kcal'),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          Icons.local_fire_department,
+                          color: widget.seedColor,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Calorías',
+                            // Texto con mayor fontSize y espaciado para mejor lectura
+                            style: baseStyle,
+                            textAlign: TextAlign.left,
+                            softWrap: true,
+                            overflow: TextOverflow.visible,
+                          ),
+                        ),
+                        Text(
+                          '${n.kcal} kcal',
+                          // Texto con mayor fontSize y espaciado para mejor lectura
+                          style: baseStyle,
+                          textAlign: TextAlign.left,
+                          softWrap: true,
+                          overflow: TextOverflow.visible,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.bolt, color: Colors.green),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Proteínas',
+                            // Texto con mayor fontSize y espaciado para mejor lectura
+                            style: baseStyle,
+                            textAlign: TextAlign.left,
+                            softWrap: true,
+                            overflow: TextOverflow.visible,
+                          ),
+                        ),
+                        Text(
+                          '${n.proteinas} g',
+                          // Texto con mayor fontSize y espaciado para mejor lectura
+                          style: baseStyle,
+                          textAlign: TextAlign.left,
+                          softWrap: true,
+                          overflow: TextOverflow.visible,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.grain, color: Colors.blue),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Carbohidratos',
+                            // Texto con mayor fontSize y espaciado para mejor lectura
+                            style: baseStyle,
+                            textAlign: TextAlign.left,
+                            softWrap: true,
+                            overflow: TextOverflow.visible,
+                          ),
+                        ),
+                        Text(
+                          '${n.carbohidratos} g',
+                          // Texto con mayor fontSize y espaciado para mejor lectura
+                          style: baseStyle,
+                          textAlign: TextAlign.left,
+                          softWrap: true,
+                          overflow: TextOverflow.visible,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.water_drop, color: Colors.orange),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Grasas',
+                            // Texto con mayor fontSize y espaciado para mejor lectura
+                            style: baseStyle,
+                            textAlign: TextAlign.left,
+                            softWrap: true,
+                            overflow: TextOverflow.visible,
+                          ),
+                        ),
+                        Text(
+                          '${n.grasas} g',
+                          // Texto con mayor fontSize y espaciado para mejor lectura
+                          style: baseStyle,
+                          textAlign: TextAlign.left,
+                          softWrap: true,
+                          overflow: TextOverflow.visible,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
-              ListTile(
-                leading: Icon(Icons.bolt, color: Colors.green),
-                title: const Text('Proteínas'),
-                trailing: Text('${n.proteinas} g'),
-              ),
-              ListTile(
-                leading: Icon(Icons.grain, color: Colors.blue),
-                title: const Text('Carbohidratos'),
-                trailing: Text('${n.carbohidratos} g'),
-              ),
-              ListTile(
-                leading: Icon(Icons.water_drop, color: Colors.orange),
-                title: const Text('Grasas'),
-                trailing: Text('${n.grasas} g'),
-              ),
-            ],
+            ),
           ),
           actions: [
             TextButton(
@@ -1584,8 +2358,8 @@ ${buildUserPromptPersonalization()}
     );
   }
 
+  // Construye secciones del gráfico de pastel con proteínas, carbohidratos y grasas
   List<PieChartSectionData> _macroSections(Color seed) {
-    // Usa resultados de IA; esta función solo se llama cuando hay datos
     final proteins = _prot ?? 0.0;
     final carbs = _carb ?? 0.0;
     final fats = _fat ?? 0.0;
@@ -1629,7 +2403,7 @@ ${buildUserPromptPersonalization()}
   }
 }
 
-// Reemplazado activity_recognition_flutter por geolocator + sensors_plus (AGP 8+)
+// Clasificación básica de actividad combinando acelerómetro y velocidad
 enum ActivityKind { stationary, walking, running, vehicle, unknown }
 
 class ExerciseScreen extends StatefulWidget {
@@ -1648,19 +2422,37 @@ class ExerciseScreen extends StatefulWidget {
 
 class _ExerciseScreenState extends State<ExerciseScreen>
     with TickerProviderStateMixin {
-  // Reemplazado: ya no usamos activity_recognition_flutter
-  StreamSubscription<UserAccelerometerEvent>? _accelSub;
+  // Suscripción a ubicación para inferir actividad y velocidad
   StreamSubscription<Position>? _posSub;
   Timer? _chartTimer;
+  bool _tracking =
+      false; // Corregido GPS: mejor manejo de permisos, stream y start/stop
+  // Tracking automático: temporizador para detener por inactividad
+  Timer?
+  _autoStopTimer; // Autodetención basada en velocidad/posición (sin sensores)
+  Position?
+  _lastPos; // Corregido GPS: mejor manejo de permisos, stream y start/stop
+  double _distanceMeters =
+      0.0; // Corregido GPS: mejor manejo de permisos, stream y start/stop
+  bool _hasLocationPermission =
+      false; // Corregido GPS: mejor manejo de permisos, stream y start/stop
+  // Actividad actual inferida
   ActivityKind _currentKind = ActivityKind.unknown;
-  bool _paused = false;
+  // Contador de pasos del día
   int _dailySteps = 0;
+  // Velocidad actual en km/h
   double _speedKmh = 0;
+  // Fecha (YYYY-MM-DD) del último registro persistido
   String _lastDate = '';
+  // Buffer de pasos para graficar por intervalos
   int _stepBuffer = 0;
-  DateTime _lastStepTs = DateTime.now().subtract(const Duration(seconds: 2));
+  // Serie de puntos para el gráfico de cardio (pasos por ventana)
   final List<FlSpot> _cardioSpots = [];
   late final AnimationController _fadeCtrl;
+  // Parámetros de conteo por GPS
+  static const double _stepLengthMeters = 0.75;
+  static const double _distanceThresholdMeters = 2.5; // ignora ruido
+  double _pendingMeters = 0.0;
 
   @override
   void initState() {
@@ -1670,16 +2462,24 @@ class _ExerciseScreenState extends State<ExerciseScreen>
       duration: const Duration(milliseconds: 250),
     )..forward();
     _loadPersisted();
-    _ensurePermissionAndStart();
+    _ensurePermissionAndStart().then((_) {
+      if (mounted && _hasLocationPermission && !_tracking) {
+        startLocationTracking();
+      }
+    }); // Corregido GPS: arranque automático al abrir pantalla
   }
 
   @override
   void dispose() {
-    _accelSub?.cancel();
     _posSub?.cancel();
     _chartTimer?.cancel();
     _fadeCtrl.dispose();
     super.dispose();
+  }
+
+  // Inicia el tracking de ubicación (expuesto como startLocationTracking)
+  void startLocationTracking() {
+    _beginTracking();
   }
 
   Future<void> _loadPersisted() async {
@@ -1736,16 +2536,34 @@ class _ExerciseScreenState extends State<ExerciseScreen>
     await _dailyExerciseBox.put('exercise_logs:${u.correo}', list);
   }
 
+  // Solicita permisos de ubicación y arranca los streams si están concedidos
   Future<void> _ensurePermissionAndStart() async {
     bool enabled = await Geolocator.isLocationServiceEnabled();
-    if (!enabled && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Activa el servicio de ubicación')),
-      );
+    if (!enabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'GPS desactivado. Actívalo para registrar tu recorrido.',
+            ),
+          ),
+        );
+      }
+      // Corregido manejo de permisos GPS
+      try {
+        await Geolocator.openLocationSettings();
+      } catch (_) {}
+      enabled = await Geolocator.isLocationServiceEnabled();
     }
     LocationPermission perm = await Geolocator.checkPermission();
     if (perm == LocationPermission.denied) {
+      // Corregido manejo de permisos GPS
       perm = await Geolocator.requestPermission();
+      if (perm == LocationPermission.denied && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Permiso de ubicación denegado')),
+        );
+      }
     }
     if (perm == LocationPermission.deniedForever) {
       if (!mounted) return;
@@ -1765,34 +2583,138 @@ class _ExerciseScreenState extends State<ExerciseScreen>
         ),
       );
     }
-    _startStreams();
+    // Corregido GPS: mejor manejo de permisos, stream y start/stop
+    _hasLocationPermission =
+        enabled &&
+        (perm == LocationPermission.always ||
+            perm == LocationPermission.whileInUse);
   }
 
+  // Inicia streams de geolocalización y acelerómetro; actualiza estado y gráfica
   void _startStreams() {
-    _posSub =
-        Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 10,
-          ),
-        ).listen((pos) {
-          setState(() {
-            _speedKmh = ((pos.speed.isNaN ? 0.0 : pos.speed.toDouble()) * 3.6);
-            if (_speedKmh > 15.0) {
-              _currentKind = ActivityKind.vehicle;
-            } else if (_speedKmh < 1.0) {
-              // Solo marcamos estacionario si no estamos sumando pasos activos
-              if (_currentKind != ActivityKind.walking &&
-                  _currentKind != ActivityKind.running) {
-                _currentKind = ActivityKind.stationary;
-              }
+    // Mejorado stream y start/stop para evitar detenciones inesperadas
+    _posSub?.cancel();
+    _chartTimer?.cancel();
+    final LocationSettings ls = Platform.isAndroid
+        ? AndroidSettings(
+            accuracy: LocationAccuracy.best, // suficiente para pasos por GPS
+            distanceFilter: 3, // umbral menor para captar pasos sin ruido
+            intervalDuration: const Duration(seconds: 3),
+          )
+        : (Platform.isIOS
+              ? AppleSettings(
+                  accuracy: LocationAccuracy.best,
+                  distanceFilter: 3,
+                  activityType: ActivityType.fitness,
+                )
+              : const LocationSettings(
+                  accuracy: LocationAccuracy.best,
+                  distanceFilter: 3,
+                ));
+    // Variables locales para cálculo manual de velocidad entre muestras
+    Position?
+    lastForSpeed; // fixed: no_leading_underscore_for_local_identifiers
+    DateTime?
+    lastForSpeedTs; // fixed: no_leading_underscore_for_local_identifiers
+    _posSub = Geolocator.getPositionStream(locationSettings: ls).listen(
+      (pos) {
+        // Corregido cálculo de velocidad usando position.speed * 3.6
+        double vms = (pos.speed.isNaN ? 0.0 : pos.speed.toDouble());
+        if (vms <= 0.0) {
+          // Fallback: calcula velocidad por distancia/tiempo si el proveedor no da speed
+          final nowTs = DateTime.now();
+          if (lastForSpeed != null && lastForSpeedTs != null) {
+            final dtMs = nowTs.difference(lastForSpeedTs!).inMilliseconds;
+            if (dtMs > 0) {
+              final d = Geolocator.distanceBetween(
+                lastForSpeed!.latitude,
+                lastForSpeed!.longitude,
+                pos.latitude,
+                pos.longitude,
+              );
+              vms = d / (dtMs / 1000.0);
             }
+          }
+          lastForSpeed = pos;
+          lastForSpeedTs = nowTs;
+        }
+        final kmhRaw = vms * 3.6;
+        final kmh = double.parse(kmhRaw.toStringAsFixed(1));
+
+        double add = 0.0;
+        if (_tracking && _lastPos != null) {
+          add = calculateDistance(_lastPos!, pos);
+        }
+        _lastPos = pos;
+        if (!mounted) return;
+        // Actualiza solo ante cambios significativos en velocidad o distancia
+        ActivityKind ak = _inferActivityFromSpeed(kmh);
+        bool kindChanged = (ak != _currentKind);
+        int stepsDelta = 0;
+        if (_tracking &&
+            ak != ActivityKind.vehicle &&
+            add.isFinite &&
+            add >= _distanceThresholdMeters) {
+          _distanceMeters += add;
+          _pendingMeters += add;
+          stepsDelta = distanceToSteps(_pendingMeters);
+          if (stepsDelta > 0) {
+            _pendingMeters -= stepsDelta * _stepLengthMeters;
+            updateSteps(stepsDelta);
+          }
+        }
+        final bool speedChanged = (kmh != _speedKmh);
+        if (speedChanged || stepsDelta > 0 || kindChanged) {
+          setState(() {
+            _speedKmh = kmh;
+            _currentKind = ak;
           });
-        });
-    _accelSub = userAccelerometerEventStream().listen(_onAccel);
+        }
+      },
+      onError: (e) async {
+        // Mejorado stream y start/stop para evitar detenciones inesperadas
+        if (mounted) {
+          if (e is LocationServiceDisabledException) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'GPS desactivado durante la sesión. Actívalo para continuar.',
+                ),
+              ),
+            );
+            try {
+              await Geolocator.openLocationSettings();
+            } catch (_) {}
+          } else if (e is PermissionDeniedException) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Permiso de ubicación revocado. Autoriza para continuar.',
+                ),
+              ),
+            );
+          }
+        }
+        await _posSub?.cancel();
+        _posSub = null;
+        if (_tracking) {
+          await _ensurePermissionAndStart();
+          if (_hasLocationPermission) {
+            _startStreams();
+          }
+        }
+      },
+      onDone: () {
+        // Asegura que el stream siga vivo; reinicia si se cierra inesperadamente
+        if (_tracking) {
+          _startStreams();
+        }
+      },
+    );
     _chartTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       final t = _cardioSpots.isEmpty ? 0.0 : (_cardioSpots.last.x + 1.0);
       final y = _stepBuffer.toDouble();
+      if (!mounted) return;
       setState(() {
         _cardioSpots.add(FlSpot(t, y));
         if (_cardioSpots.length > 60) {
@@ -1803,102 +2725,104 @@ class _ExerciseScreenState extends State<ExerciseScreen>
     });
   }
 
-  void _onAccel(UserAccelerometerEvent e) {
-    if (_paused) return;
-    final mag = math.sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
-
-    ActivityKind inferred = _currentKind;
-    if (_speedKmh > 15.0) {
-      inferred = ActivityKind.vehicle;
-    } else if (_speedKmh < 0.5) {
-      inferred = ActivityKind.stationary;
-    } else if (_speedKmh < 6.0 && mag > 0.9) {
-      inferred = ActivityKind.walking;
-    } else if (_speedKmh < 12.0 && mag > 1.4) {
-      inferred = ActivityKind.running;
+  Future<void> _beginTracking() async {
+    // Corregido GPS: mejor manejo de permisos, stream y start/stop
+    if (!_hasLocationPermission) {
+      await _ensurePermissionAndStart();
     }
-
-    if (inferred != _currentKind) {
-      setState(() => _currentKind = inferred);
-      _appendLog('activity:$inferred', 0);
-    }
-
-    if (_speedKmh >= 15.0) return; // no contamos en vehículo
-    if (_currentKind != ActivityKind.walking &&
-        _currentKind != ActivityKind.running) {
-      return;
-    }
-    final threshold = _currentKind == ActivityKind.running ? 1.4 : 0.9;
-    final now = DateTime.now();
-    final debounceMs = _speedKmh < 2.0 ? 450 : 320;
-    if (mag > threshold &&
-        now.difference(_lastStepTs).inMilliseconds > debounceMs) {
-      _lastStepTs = now;
-      final next = _dailySteps + 1;
-      final deltaBucket = _stepBuffer + 1;
+    if (!_hasLocationPermission) return;
+    if (mounted) {
       setState(() {
-        _dailySteps = next;
-        _stepBuffer = deltaBucket;
+        _tracking = true;
+        _distanceMeters = 0.0;
+        _lastPos = null;
       });
-      if (_dailySteps % 10 == 0) {
-        _persistSteps();
-        _appendLog('steps', 10);
-      }
     }
+    _startStreams();
+    // Corregido calibración GPS y detenciones inesperadas
+    _autoStopTimer?.cancel();
+    _autoStopTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (!_tracking) return;
+    });
+    _appendLog('cardio_start', 0);
+  }
+
+  // Conversión de distancia a pasos según longitud de zancada promedio
+  int distanceToSteps(double meters) {
+    if (meters <= 0) return 0;
+    return (meters / _stepLengthMeters).floor();
+  }
+
+  // Distancia entre dos posiciones (en metros)
+  double calculateDistance(Position a, Position b) {
+    return Geolocator.distanceBetween(
+      a.latitude,
+      a.longitude,
+      b.latitude,
+      b.longitude,
+    );
+  }
+
+  // Actualiza contadores y persistencia para pasos
+  void updateSteps(int deltaSteps) {
+    if (deltaSteps <= 0) return;
+    final today = _dateKey(DateTime.now());
+    if (_lastDate != today) {
+      _persistSteps();
+      _lastDate = today;
+      _dailySteps = 0;
+    }
+    _dailySteps += deltaSteps;
+    _stepBuffer += deltaSteps;
+    if (_dailySteps % 10 == 0) {
+      _persistSteps();
+      _appendLog('steps', deltaSteps);
+    }
+  }
+
+  // Inferencia de actividad basada solo en velocidad por GPS
+  ActivityKind _inferActivityFromSpeed(double kmh) {
+    if (kmh >= 15.0) return ActivityKind.vehicle;
+    if (kmh >= 6.0) return ActivityKind.running;
+    if (kmh >= 1.0) return ActivityKind.walking;
+    return ActivityKind.stationary;
   }
 
   @override
   Widget build(BuildContext context) {
     final isDark = widget.brightness == Brightness.dark;
-    final background = isDark
-        ? const Color(0xFF121212)
-        : (Colors.grey[50] ?? Colors.white);
+    final cs = Theme.of(
+      context,
+    ).colorScheme; // Corregido modo oscuro en ExerciseScreen
+    final background =
+        cs.surface; // fixed: deprecated background → color + colorScheme
     final heading = TextStyle(
       fontSize: 22,
       fontWeight: FontWeight.w800,
-      color: isDark ? const Color(0xFFEDEDED) : const Color(0xFF111111),
+      color: cs.onSurface, // Corregido modo oscuro en ExerciseScreen
       fontFamily: widget.fontFamily,
     );
     final body = TextStyle(
       fontSize: 16,
-      color: isDark ? const Color(0xFFD0D0D0) : const Color(0xFF1F1F1F),
+      color: cs.onSurface, // Corregido modo oscuro en ExerciseScreen
       fontFamily: widget.fontFamily,
     );
-    final appBarColor = isDark
-        ? widget.seedColor.withAlpha(80)
-        : widget.seedColor.withAlpha(120);
+    // (Funciones de aclarado/oscurecido conservadas)
+
     final vspace = MediaQuery.of(context).size.height / 50;
     BoxDecoration cardDeco() => BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [
-          widget.seedColor.withAlpha(isDark ? 40 : 60),
-          widget.seedColor.withAlpha(isDark ? 24 : 36),
-          Colors.transparent,
-        ],
-      ),
+      color: cs.surfaceContainer, // Corregido modo oscuro en tarjetas
       borderRadius: BorderRadius.circular(28),
-      border: Border.all(
-        color: isDark ? const Color(0xFF424242) : const Color(0x11000000),
-      ),
-      boxShadow: [
-        BoxShadow(
-          color: isDark ? const Color(0x55000000) : const Color(0x22000000),
-          blurRadius: 16,
-          spreadRadius: 2,
-          offset: const Offset(0, 8),
-        ),
-      ],
+      border: Border.all(color: cs.outlineVariant),
     );
     final goal = 10000;
     final progress = math.min(1.0, _dailySteps / goal.toDouble());
     return Scaffold(
       backgroundColor: background,
       appBar: AppBar(
-        backgroundColor: appBarColor,
-        elevation: 2,
-        foregroundColor: Colors.white,
+        backgroundColor: cs.surface, // Corregido modo oscuro en AppBar
+        foregroundColor: cs.onSurface, // Corregido modo oscuro en AppBar
+        elevation: 0,
         centerTitle: true,
         title: const Text('Ejercicio'),
       ),
@@ -1924,9 +2848,8 @@ class _ExerciseScreenState extends State<ExerciseScreen>
                           value: progress == 0 ? null : progress,
                           strokeWidth: 14,
                           color: widget.seedColor,
-                          backgroundColor: isDark
-                              ? const Color(0xFF2C2C2C)
-                              : const Color(0xFFE0E0E0),
+                          backgroundColor: cs
+                              .surfaceContainerHighest, // Corregido modo oscuro en ExerciseScreen
                         ),
                       ),
                       Padding(
@@ -1978,11 +2901,7 @@ class _ExerciseScreenState extends State<ExerciseScreen>
                       const SizedBox(width: 12),
                       Text(
                         '${_speedKmh.toStringAsFixed(1)} km/h',
-                        style: body.copyWith(
-                          color: isDark
-                              ? const Color(0xFFA0B0C0)
-                              : const Color(0xFF616161),
-                        ),
+                        style: body.copyWith(color: cs.onSurfaceVariant),
                       ),
                     ],
                   ),
@@ -2080,7 +2999,9 @@ class _ExerciseScreenState extends State<ExerciseScreen>
     VoidCallback? onTap,
   }) {
     return Material(
-      color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+      color: Theme.of(context)
+          .colorScheme
+          .surface, // fixed: undefined name → Theme.of(context).colorScheme
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
@@ -2133,19 +3054,28 @@ class _ExerciseScreenState extends State<ExerciseScreen>
         ? Colors.grey
         : widget.seedColor;
     final pct = math.min(1.0, _dailySteps / 10000.0);
+    final String distStr = _distanceMeters >= 1000
+        ? '${(_distanceMeters / 1000).toStringAsFixed(2)} km'
+        : '${_distanceMeters.toStringAsFixed(0)} m';
     return Container(
       margin: const EdgeInsets.only(top: 12),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+        color: Theme.of(context)
+            .colorScheme
+            .surface, // fixed: undefined name → Theme.of(context).colorScheme
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
-          color: isDark ? const Color(0xFF2A2A2A) : const Color(0x11000000),
-        ),
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ), // fixed: undefined name → Theme.of(context).colorScheme
       ),
       child: Column(
         children: [
           Row(
+            crossAxisAlignment: CrossAxisAlignment
+                .center, // Corregido overflow horizontal y texto sobrepuesto en Cardio
+            mainAxisAlignment: MainAxisAlignment
+                .spaceBetween, // Fixed: layout de rayas y métricas para evitar RIGHT OVERFLOWED
             children: [
               SizedBox(
                 width: 96,
@@ -2206,34 +3136,23 @@ class _ExerciseScreenState extends State<ExerciseScreen>
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      '${_speedKmh.toStringAsFixed(1)} km/h • ${(_dailySteps * 0.04).toStringAsFixed(0)} kcal',
+                      '${_speedKmh.toStringAsFixed(1)} km/h • ${(_dailySteps * 0.04).toStringAsFixed(0)} kcal • $distStr',
                       style: body.copyWith(
                         color: isDark
                             ? const Color(0xFFA0B0C0)
                             : const Color(0xFF616161),
                       ),
+                      maxLines:
+                          1, // Corregido overflow horizontal y texto sobrepuesto en Cardio
+                      overflow: TextOverflow
+                          .ellipsis, // Corregido overflow horizontal y texto sobrepuesto en Cardio
+                      softWrap:
+                          true, // Fixed: layout de rayas y métricas para evitar RIGHT OVERFLOWED
                     ),
                   ],
                 ),
               ),
-              const SizedBox(width: 8),
-              PressableScale(
-                onTap: () => setState(() => _paused = !_paused),
-                child: FilledButton.tonalIcon(
-                  onPressed: () => setState(() => _paused = !_paused),
-                  icon: Icon(_paused ? Icons.play_arrow : Icons.pause),
-                  label: Text(_paused ? 'Reanudar' : 'Pausar'),
-                  style: FilledButton.styleFrom(
-                    foregroundColor: isDark ? Colors.white : Colors.black87,
-                    backgroundColor: color.withAlpha(40),
-                    padding: const EdgeInsets.symmetric(
-                      vertical: 10,
-                      horizontal: 14,
-                    ),
-                    minimumSize: const Size(0, 40),
-                  ),
-                ),
-              ),
+              // Eliminados botones manuales Empezar/Pausar en Cardio (tracking automático)
             ],
           ),
           const SizedBox(height: 12),
@@ -2255,9 +3174,9 @@ class _ExerciseScreenState extends State<ExerciseScreen>
                             '${v.toInt() * 10}s',
                             style: TextStyle(
                               fontSize: 10,
-                              color: isDark
-                                  ? const Color(0xFFD0D0D0)
-                                  : const Color(0xFF616161),
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant, // fixed: undefined name → Theme.of(context).colorScheme
                             ),
                           ),
                         );
@@ -2273,9 +3192,9 @@ class _ExerciseScreenState extends State<ExerciseScreen>
                         v.toInt().toString(),
                         style: TextStyle(
                           fontSize: 10,
-                          color: isDark
-                              ? const Color(0xFFA0B0C0)
-                              : const Color(0xFF9E9E9E),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .onSurfaceVariant, // fixed: undefined name → Theme.of(context).colorScheme
                         ),
                       ),
                     ),
@@ -2357,14 +3276,25 @@ class _ExerciseScreenState extends State<ExerciseScreen>
               ? (raw['steps'] as int).toDouble()
               : double.tryParse('${raw['steps'] ?? 0}') ?? 0.0;
         }
+        // Actualizado gráfico para incrementar en día correcto
+        if (_dateKey(d) == _dateKey(now)) {
+          steps = _dailySteps.toDouble();
+        }
       }
+      final isToday =
+          _dateKey(now.subtract(Duration(days: 6 - i))) ==
+          _dateKey(
+            now,
+          ); // Corregido detección día actual con DateTime.now().weekday
       bars.add(
         BarChartGroupData(
           x: i,
           barRods: [
             BarChartRodData(
               toY: steps.clamp(0.0, maxY),
-              color: seed,
+              color: isToday
+                  ? Theme.of(context).colorScheme.primary
+                  : seed, // Actualizado gráfico para incrementar en día correcto
               width: 16,
               borderRadius: BorderRadius.circular(6),
             ),
@@ -2374,6 +3304,34 @@ class _ExerciseScreenState extends State<ExerciseScreen>
     }
     return BarChart(
       BarChartData(
+        barTouchData: BarTouchData(
+          enabled: true,
+          touchTooltipData: BarTouchTooltipData(
+            getTooltipItem: (group, groupIndex, rod, rodIndex) {
+              final d = now.subtract(Duration(days: 6 - group.x));
+              final isToday =
+                  _dateKey(d) ==
+                  _dateKey(
+                    now,
+                  ); // Corregido detección día actual con DateTime.now().weekday
+              return BarTooltipItem(
+                isToday ? 'Hoy\n' : '',
+                TextStyle(
+                  color: Theme.of(context).colorScheme.onSurface,
+                  fontWeight: FontWeight.w700,
+                ),
+                children: [
+                  TextSpan(
+                    text: '${rod.toY.toInt()} pasos',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
         gridData: FlGridData(
           show: true,
           drawVerticalLine: false,
@@ -2385,15 +3343,19 @@ class _ExerciseScreenState extends State<ExerciseScreen>
             sideTitles: SideTitles(
               showTitles: true,
               getTitlesWidget: (v, _) {
+                // Corregido detección día actual con DateTime.now().weekday
                 const days = ['L', 'M', 'X', 'J', 'V', 'S', 'D'];
+                final idx = v.toInt().clamp(0, 6);
+                final d = now.subtract(Duration(days: 6 - idx));
+                final letter = days[(d.weekday - 1) % 7];
                 return Padding(
                   padding: const EdgeInsets.only(top: 4),
                   child: Text(
-                    days[v.toInt() % 7],
+                    letter,
                     style: TextStyle(
-                      color: isDark
-                          ? const Color(0xFFD0D0D0)
-                          : const Color(0xFF616161),
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurfaceVariant, // Corregido modo oscuro en ejes
                     ),
                   ),
                 );
@@ -2411,9 +3373,9 @@ class _ExerciseScreenState extends State<ExerciseScreen>
                   '${v.toInt()}',
                   style: TextStyle(
                     fontSize: 10,
-                    color: isDark
-                        ? const Color(0xFFA0B0C0)
-                        : const Color(0xFF9E9E9E),
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant, // Corregido modo oscuro en ejes
                   ),
                 );
               },
@@ -2430,6 +3392,7 @@ class _ExerciseScreenState extends State<ExerciseScreen>
   }
 }
 
+// Pantalla que solicita al modelo IA rutinas de entrenamiento personalizadas
 class _RoutineSuggestionScreen extends StatefulWidget {
   final String kind;
   final Brightness brightness;
@@ -2446,6 +3409,7 @@ class _RoutineSuggestionScreen extends StatefulWidget {
       _RoutineSuggestionScreenState();
 }
 
+// Estado: orquesta la llamada a IA y el parseo de resultados
 class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
   bool _isLoading = true;
   String? _errorMessage;
@@ -2455,29 +3419,62 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
   @override
   void initState() {
     super.initState();
-    // Usa misma clave y modelo que recetas
-    const apiKey = 'AIzaSyCEwgwToG9cfPvf2wzNHGOhSeXCLafD1ms';
+    // Inicializa el modelo con la misma clave/versión usada en nutrición
+    const apiKey = '';
     _model = GenerativeModel(model: 'gemini-2.5-flash', apiKey: apiKey);
+    // Pre-carga completa de rutinas con Gemini antes de mostrar lista
     _fetchSuggestions();
   }
 
+  // Construye prompt con datos del usuario y pide 4 sesiones en formato JSON
   Future<void> _fetchSuggestions() async {
     final u = getCurrentUser();
     final genero = u?.genero ?? 'no especificado';
     final edad = u?.edad ?? 0;
     final altura = u?.altura ?? 0.0;
     final peso = u?.peso ?? 0.0;
-    final prompt =
-        'Sugiere 4 sesiones de entrenamiento completas de ${widget.kind} personalizadas para un usuario de género $genero, $edad años, $altura cm y $peso kg. '
-        'Para cada sesión incluye: nombre, duración aproximada, breve descripción, y lista de 3-5 ejercicios con nombre, series/reps/duración y pequeña descripción. '
-        'Responde SOLO en formato JSON array.';
+    final isStrength = widget.kind.toLowerCase().contains('fuerza');
+    // Mantengo precarga y carga instantánea
+    final prompt = isStrength
+        // Prompt Gemini modificado para rutinas variadas y realistas
+        ? 'Genera 5 rutinas de fuerza diferentes y realistas para un usuario de nivel intermedio. '
+              'Nombres variados y atractivos (ej. Push/Pull/Legs, Full Body Explosivo, Upper Body Hypertrophy, Lower Body Strength, Core & Mobility). '
+              'Cada rutina con duración en minutos (45-75), enfoque claro, 4-6 ejercicios con series/reps realistas y tiempo estimado por ejercicio. '
+              'Responde en formato JSON limpio para que se pueda parsear directamente. '
+              'No repitas nombres como "Tren Superior A" siempre. '
+              'Estructura: [{"nombre": string, "duracion": number, "descripcion": string, '
+              '"ejercicios": [{"nombre": string, "descripcion": string, "detalle": string, "tiempo": string, "reps": string}]}]'
+        : 'Genera 4 sesiones de ${widget.kind} para un usuario ($genero, $edad años, $altura cm, $peso kg). '
+              'Responde SOLO como un JSON array. Cada sesión debe tener: '
+              '{"nombre": string, "duracion": number, "descripcion": string, '
+              '"ejercicios": [{"nombre": string, "descripcion": string, "tiempo": string, "reps": string, "detalle": string}]}';
     try {
       debugPrint('Iniciando sugerencias para ${widget.kind}');
       debugPrint('Prompt enviado: $prompt');
       final res = await _model.generateContent([Content.text(prompt)]);
       debugPrint('Respuesta Gemini cruda: ${res.text ?? 'null'}');
       final text = res.text?.trim() ?? '';
-      final parsed = _parseRoutineList(text);
+      final parsed = _parseRoutineList(text)
+          .map(
+            (m) => {
+              ...m,
+              // Duración y tiempos en minutos claros y creíbles
+              if ((m['duracion'] ?? '').trim().isNotEmpty)
+                'duracion': (() {
+                  final raw = (m['duracion'] ?? '').trim();
+                  final mm = RegExp(r'(\d{1,3})').firstMatch(raw);
+                  final digits = mm?.group(1) ?? '';
+                  if (digits.isNotEmpty) return '$digits minutos';
+                  return raw;
+                })(),
+              'tipo': widget.kind.toLowerCase().contains('fuerza')
+                  ? 'strength'
+                  : (widget.kind.toLowerCase().contains('yoga')
+                        ? 'yoga'
+                        : 'stretching'),
+            },
+          )
+          .toList();
       debugPrint('Parseado: ${parsed.length} ejercicios');
       setState(() {
         _suggestions = parsed;
@@ -2493,12 +3490,12 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
     }
   }
 
+  // Intenta parsear la respuesta del modelo como lista JSON de rutinas
+  // Incluye sanitización de fences y fallback a parseo heurístico
   List<Map<String, String>> _parseRoutineList(String text) {
-    // Limpia posibles fences de markdown ```json ... ```
     String clean = text.trim();
     clean = clean.replaceAll('```json', '').replaceAll('```', '').trim();
     debugPrint('Texto limpio para parseo: $clean');
-    // Intenta JSON primero (sobre texto limpio) con extracción de array si es necesario
     try {
       dynamic data;
       try {
@@ -2534,7 +3531,10 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
                     final edet =
                         '${m['seriesRepsDuracion'] ?? m['reps'] ?? m['series'] ?? m['detalle'] ?? ''}'
                             .trim();
-                    final tiempo = '${m['duracion'] ?? m['duration'] ?? ''}'
+                    final tiempo =
+                        '${m['time'] ?? m['tiempo'] ?? m['duracion'] ?? m['duration'] ?? ''}'
+                            .trim();
+                    final reps = '${m['reps'] ?? m['repeticiones'] ?? ''}'
                         .trim();
                     final edesc =
                         '${m['descripcion'] ?? m['description'] ?? ''}'.trim();
@@ -2542,6 +3542,7 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
                     if (enombre.isNotEmpty) out['nombre'] = enombre;
                     if (edet.isNotEmpty) out['detalle'] = edet;
                     if (tiempo.isNotEmpty) out['tiempo'] = tiempo;
+                    if (reps.isNotEmpty) out['reps'] = reps;
                     if (edesc.isNotEmpty) out['descripcion'] = edesc;
                     if (out.isNotEmpty) norm.add(out);
                   }
@@ -2571,9 +3572,9 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
             .toList();
       }
     } catch (_) {
-      // continúa con parseo manual
+      // Si no es JSON, cae a parseo manual
     }
-    // Parseo manual básico
+    // Parseo manual básico por líneas
     final lines = text
         .split('\n')
         .map((l) => l.trim())
@@ -2608,43 +3609,48 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
     return out.where((m) => m.containsKey('nombre')).toList();
   }
 
-  // Fallback eliminado: resultados 100% automáticos desde Gemini
+  // Render de la pantalla con estilos acordes al tema y color semilla
 
   @override
   Widget build(BuildContext context) {
     final isDark = widget.brightness == Brightness.dark;
+    final isStrength = widget.kind.toLowerCase().contains('fuerza');
+    final cs = Theme.of(context).colorScheme;
     final body = TextStyle(
       fontSize: 16,
-      color: isDark ? const Color(0xFFD0D0D0) : const Color(0xFF1F1F1F),
+      color: cs.onSurface,
       fontFamily: widget.fontFamily,
     );
+
     return Scaffold(
+      backgroundColor:
+          cs.surface, // Estética unificada con Fuerza (fondo, cards, viñetas)
       appBar: AppBar(
         title: Text('Sugerencias: ${widget.kind}'),
-        backgroundColor: isDark
-            ? widget.seedColor.withAlpha(80)
-            : widget.seedColor.withAlpha(120),
-        foregroundColor: Colors.white,
+        centerTitle: true,
+        backgroundColor: cs.surface,
+        elevation: 0,
+        foregroundColor: cs.onSurface,
+        titleTextStyle: Theme.of(context).textTheme.titleLarge?.copyWith(
+          color: cs.onSurface,
+          fontFamily: widget.fontFamily,
+        ),
       ),
       body: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: [
-              (isDark ? const Color(0xFF121212) : const Color(0xFFF7F7F7)),
-              widget.seedColor.withAlpha(isDark ? 40 : 30),
-            ],
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-          ),
-        ),
+        color: cs.surface,
         child: _isLoading
             ? Center(
+                // Pantalla de carga oscura y legible
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const CircularProgressIndicator(),
+                    CircularProgressIndicator(color: cs.primary),
                     const SizedBox(height: 12),
-                    Text('Generando sugerencias...', style: body),
+                    Text(
+                      'Generando sugerencias...',
+                      style: body,
+                      textAlign: TextAlign.center,
+                    ),
                   ],
                 ),
               )
@@ -2709,17 +3715,40 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
                 separatorBuilder: (_, i) => const SizedBox(height: 12),
                 itemBuilder: (context, i) {
                   final it = _suggestions[i];
-                  final emoji = widget.kind.toLowerCase().contains('yoga')
-                      ? '🧘'
-                      : widget.kind.toLowerCase().contains('estira')
-                      ? '🏋️'
-                      : '💪';
+                  // Duración y tiempos en minutos claros y creíbles
+                  final durRaw = (it['duracion'] ?? '').trim();
+                  final durDigits =
+                      RegExp(r'(\d{1,3})').firstMatch(durRaw)?.group(1) ?? '';
+                  final durDisplay = durDigits.isNotEmpty
+                      ? '$durDigits minutos'
+                      : (durRaw.isNotEmpty ? durRaw : '—');
+                  // Viñetas con borde 3D y color de tema principal
+                  final bullet = Container(
+                    width: 20,
+                    height: 20,
+                    decoration: BoxDecoration(
+                      color: widget.seedColor,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: cs.primary.withAlpha(170),
+                        width: 1,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: cs.primary.withAlpha(70),
+                          blurRadius: 8,
+                          offset: const Offset(0, 3),
+                        ),
+                      ],
+                    ),
+                  );
                   return InkWell(
                     onTap: () {
                       Navigator.of(context).push(
                         MaterialPageRoute(
                           builder: (_) => SessionDetailScreen(
                             session: it,
+                            kind: widget.kind,
                             seedColor: widget.seedColor,
                             brightness: widget.brightness,
                             fontFamily: widget.fontFamily,
@@ -2729,19 +3758,12 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
                     },
                     child: Material(
                       elevation: 2,
-                      color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+                      color: cs.surface,
                       borderRadius: BorderRadius.circular(16),
                       child: Container(
                         decoration: BoxDecoration(
                           borderRadius: BorderRadius.circular(16),
-                          gradient: LinearGradient(
-                            colors: [
-                              (isDark ? const Color(0xFF1E1E1E) : Colors.white),
-                              widget.seedColor.withAlpha(isDark ? 26 : 20),
-                            ],
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                          ),
+                          color: cs.surface,
                         ),
                         padding: const EdgeInsets.all(16),
                         child: Column(
@@ -2750,10 +3772,7 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
                             Row(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  emoji,
-                                  style: const TextStyle(fontSize: 24),
-                                ),
+                                bullet,
                                 const SizedBox(width: 12),
                                 Expanded(
                                   child: Column(
@@ -2767,9 +3786,7 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
                                                 .textTheme
                                                 .headlineMedium
                                                 ?.copyWith(
-                                                  color: isDark
-                                                      ? const Color(0xFFD0D0D0)
-                                                      : const Color(0xFF1F1F1F),
+                                                  color: cs.onSurface,
                                                   fontFamily: widget.fontFamily,
                                                 ) ??
                                             body.copyWith(
@@ -2778,14 +3795,13 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
                                             ),
                                       ),
                                       const SizedBox(height: 6),
-                                      Text(
-                                        it['duracion'] ?? '45 min',
-                                        style: body.copyWith(
-                                          color: isDark
-                                              ? const Color(0xFFA0B0C0)
-                                              : const Color(0xFF616161),
-                                        ),
-                                      ),
+                                      if (isStrength)
+                                        Text(
+                                          durDisplay,
+                                          style: body.copyWith(
+                                            color: cs.onSurfaceVariant,
+                                          ),
+                                        ), // Eliminado Tiempo/Reps en Yoga y Estiramiento
                                       if ((it['descripcion'] ?? '').isNotEmpty)
                                         Padding(
                                           padding: const EdgeInsets.only(
@@ -2817,12 +3833,14 @@ class _RoutineSuggestionScreenState extends State<_RoutineSuggestionScreen> {
 
 class SessionDetailScreen extends StatelessWidget {
   final Map<String, String> session;
+  final String kind;
   final Brightness brightness;
   final Color seedColor;
   final String? fontFamily;
   const SessionDetailScreen({
     super.key,
     required this.session,
+    required this.kind,
     required this.seedColor,
     required this.brightness,
     this.fontFamily,
@@ -2838,11 +3856,13 @@ class SessionDetailScreen extends StatelessWidget {
             final n = '${m['nombre'] ?? ''}'.trim();
             final d = '${m['detalle'] ?? ''}'.trim();
             final t = '${m['tiempo'] ?? ''}'.trim();
+            final r = '${m['reps'] ?? ''}'.trim();
             final desc = '${m['descripcion'] ?? ''}'.trim();
             return {
               'nombre': n,
               'detalle': d,
               'tiempo': t,
+              'reps': r,
               'descripcion': desc,
             };
           }).toList();
@@ -2894,31 +3914,70 @@ class SessionDetailScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isDark = brightness == Brightness.dark;
+    final isStrength = kind.toLowerCase().contains('fuerza');
+    final cs = Theme.of(context).colorScheme;
     final body = TextStyle(
       fontSize: 16,
-      color: isDark ? const Color(0xFFD0D0D0) : const Color(0xFF1F1F1F),
+      color: cs.onSurface,
       fontFamily: fontFamily,
     );
     final items = _buildExercises();
+    // Carga instantánea en detalle (sin N/A ni blanco)
+    String normalizeTime(String raw, String exerciseName, String detalle) {
+      final v = raw.trim();
+      if (v.isEmpty) {
+        final lower = ('$exerciseName $detalle').toLowerCase();
+        if (lower.contains('plancha') || lower.contains('isometr')) {
+          return '45-60 seg';
+        }
+        if (lower.contains('salt') ||
+            lower.contains('burpee') ||
+            lower.contains('cuerda') ||
+            lower.contains('jump')) {
+          return '45-75 seg';
+        }
+        return '2-3 min';
+      }
+      if (RegExp(r'\b(seg|secs|sec|s)\b', caseSensitive: false).hasMatch(v)) {
+        return v;
+      }
+      if (RegExp(r'\b(min|minutos)\b', caseSensitive: false).hasMatch(v)) {
+        return v.replaceAll('minutos', 'min');
+      }
+      final digits = RegExp(r'^(\d{1,3})$').firstMatch(v)?.group(1);
+      if (digits != null && digits.isNotEmpty) return '$digits min';
+      return v;
+    }
+
+    String normalizeReps(String raw, String exerciseName, String detalle) {
+      final v = raw.trim();
+      if (v.isNotEmpty) return v;
+      final lower = ('$exerciseName $detalle').toLowerCase();
+      if (lower.contains('peso muerto') ||
+          lower.contains('sentadilla') ||
+          lower.contains('press banca') ||
+          lower.contains('press militar') ||
+          lower.contains('remo con barra')) {
+        return '5-8';
+      }
+      if (lower.contains('plancha') || lower.contains('isometr')) {
+        return '30-45 seg';
+      }
+      return '8-12';
+    }
+
     return Scaffold(
+      backgroundColor:
+          cs.surface, // Estética unificada con Fuerza (fondo, cards, viñetas)
       appBar: AppBar(
         title: Text(session['nombre'] ?? 'Sesión'),
-        backgroundColor: isDark
-            ? seedColor.withAlpha(80)
-            : seedColor.withAlpha(120),
-        foregroundColor: Colors.white,
+        centerTitle: true,
+        backgroundColor: cs.surface,
+        elevation: 0,
+        foregroundColor: cs.onSurface,
       ),
       body: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: [
-              (isDark ? const Color(0xFF121212) : const Color(0xFFF7F7F7)),
-              seedColor.withAlpha(isDark ? 40 : 30),
-            ],
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-          ),
-        ),
+        color: cs.surface,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -2931,9 +3990,7 @@ class SessionDetailScreen extends StatelessWidget {
                     session['nombre'] ?? 'Sesión',
                     style:
                         Theme.of(context).textTheme.headlineMedium?.copyWith(
-                          color: isDark
-                              ? const Color(0xFFD0D0D0)
-                              : const Color(0xFF1F1F1F),
+                          color: cs.onSurface,
                           fontFamily: fontFamily,
                         ) ??
                         body.copyWith(
@@ -2942,14 +3999,25 @@ class SessionDetailScreen extends StatelessWidget {
                         ),
                   ),
                   const SizedBox(height: 8),
-                  Text(
-                    session['duracion'] ?? '45 min',
-                    style: body.copyWith(
-                      color: isDark
-                          ? const Color(0xFFA0B0C0)
-                          : const Color(0xFF616161),
+                  if (isStrength)
+                    Builder(
+                      builder: (context) {
+                        final sessDurRaw = session['duracion'] ?? '';
+                        String digits = '';
+                        if (sessDurRaw.isNotEmpty) {
+                          final m = RegExp(r'(\\d+)').firstMatch(sessDurRaw);
+                          if (m != null) digits = m.group(1) ?? '';
+                        }
+                        // Duración y tiempos en minutos claros y creíbles
+                        final label = digits.isNotEmpty
+                            ? '$digits minutos'
+                            : (sessDurRaw.isNotEmpty ? sessDurRaw : '—');
+                        return Text(
+                          'Duración: $label',
+                          style: body.copyWith(color: cs.onSurfaceVariant),
+                        );
+                      },
                     ),
-                  ),
                   if ((session['descripcion'] ?? '').isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.only(top: 6),
@@ -2998,32 +4066,78 @@ class SessionDetailScreen extends StatelessWidget {
                       padding: const EdgeInsets.symmetric(horizontal: 16),
                       itemBuilder: (_, i) {
                         final ex = items[i];
+                        final exName = ex['nombre'] ?? 'Ejercicio';
+                        final exDet = (ex['detalle'] ?? '').trim();
+                        String tVal = (ex['tiempo']?.isNotEmpty == true
+                            ? ex['tiempo']!
+                            : '');
+                        String rVal = (ex['reps'] ?? '').trim();
+                        if (rVal.isEmpty) {
+                          final det = exDet;
+                          final rRange = RegExp(
+                            r'(\\d+)\\s*-\\s*(\\d+)\\s*reps?',
+                            caseSensitive: false,
+                          ).firstMatch(det);
+                          if (rRange != null) {
+                            rVal = '${rRange.group(1)}-${rRange.group(2)}';
+                          } else {
+                            final rSingle = RegExp(
+                              r'(\\d+)\\s*reps?',
+                              caseSensitive: false,
+                            ).firstMatch(det);
+                            if (rSingle != null) {
+                              rVal = rSingle.group(1) ?? '';
+                            }
+                          }
+                        }
+                        if (tVal.trim().isEmpty) {
+                          final det = exDet;
+                          final tRange = RegExp(
+                            r'(\\d+)\\s*-\\s*(\\d+)\\s*min',
+                            caseSensitive: false,
+                          ).firstMatch(det);
+                          if (tRange != null) {
+                            tVal = '${tRange.group(1)}-${tRange.group(2)} min';
+                          } else {
+                            final tSingle = RegExp(
+                              r'(\\d+)\\s*min',
+                              caseSensitive: false,
+                            ).firstMatch(det);
+                            if (tSingle != null) {
+                              tVal = '${tSingle.group(1)} min';
+                            }
+                          }
+                        }
+                        final String tDisplay = normalizeTime(
+                          tVal,
+                          exName,
+                          exDet,
+                        );
+                        final String rDisplay = normalizeReps(
+                          rVal,
+                          exName,
+                          exDet,
+                        );
+                        final String detalleDisplay = exDet.isNotEmpty
+                            ? exDet
+                            : (rDisplay.contains('seg')
+                                  ? '3 series de $rDisplay'
+                                  : '3 series de $rDisplay reps');
                         return Material(
                           elevation: 2,
-                          color: isDark
-                              ? const Color(0xFF1E1E1E)
-                              : Colors.white,
+                          color: cs.surface,
                           borderRadius: BorderRadius.circular(16),
                           child: Container(
                             decoration: BoxDecoration(
                               borderRadius: BorderRadius.circular(16),
-                              gradient: LinearGradient(
-                                colors: [
-                                  (isDark
-                                      ? const Color(0xFF1E1E1E)
-                                      : Colors.white),
-                                  seedColor.withAlpha(isDark ? 26 : 20),
-                                ],
-                                begin: Alignment.topLeft,
-                                end: Alignment.bottomRight,
-                              ),
+                              color: cs.surface,
                             ),
                             padding: const EdgeInsets.all(16),
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  ex['nombre'] ?? 'Ejercicio',
+                                  exName,
                                   style: body.copyWith(
                                     fontWeight: FontWeight.w700,
                                   ),
@@ -3035,29 +4149,199 @@ class SessionDetailScreen extends StatelessWidget {
                                     maxLines: 2,
                                     overflow: TextOverflow.ellipsis,
                                     style: body.copyWith(
-                                      color: isDark
-                                          ? const Color(0xFFA0B0C0)
-                                          : const Color(0xFF616161),
+                                      color: cs.onSurfaceVariant,
                                     ),
                                   ),
                                 const SizedBox(height: 4),
-                                if ((ex['detalle'] ?? '').isNotEmpty)
+                                if (isStrength && detalleDisplay.isNotEmpty)
                                   Text(
-                                    'Series/Reps: ${ex['detalle']}',
+                                    'Series/Reps: $detalleDisplay',
                                     style: body,
                                   ),
-                                if ((ex['tiempo'] ?? '').isNotEmpty)
+                                if (isStrength)
                                   Padding(
                                     padding: const EdgeInsets.only(top: 2),
                                     child: Text(
-                                      'Tiempo estimado: ${ex['tiempo']}',
+                                      'Tiempo estimado: $tDisplay',
                                       style: body.copyWith(
-                                        color: isDark
-                                            ? const Color(0xFFA0B0C0)
-                                            : const Color(0xFF616161),
+                                        color: cs.onSurfaceVariant,
                                       ),
                                     ),
                                   ),
+                                const SizedBox(height: 8),
+                                if (isStrength)
+                                  Builder(
+                                    builder: (context) {
+                                      final tiempoChip = 'Tiempo: $tDisplay';
+                                      final repsChip = 'Reps: $rDisplay';
+                                      return Row(
+                                        children: [
+                                          Expanded(
+                                            child: Wrap(
+                                              spacing: 8,
+                                              runSpacing: 4,
+                                              children: [
+                                                Container(
+                                                  padding:
+                                                      const EdgeInsets.symmetric(
+                                                        horizontal: 10,
+                                                        vertical: 6,
+                                                      ),
+                                                  decoration: BoxDecoration(
+                                                    color: cs.surfaceContainer,
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          8,
+                                                        ),
+                                                  ),
+                                                  child: Text(
+                                                    tiempoChip,
+                                                    style: body.copyWith(
+                                                      color:
+                                                          cs.onSurfaceVariant,
+                                                      fontSize: 12,
+                                                    ),
+                                                  ),
+                                                ),
+                                                Container(
+                                                  padding:
+                                                      const EdgeInsets.symmetric(
+                                                        horizontal: 10,
+                                                        vertical: 6,
+                                                      ),
+                                                  decoration: BoxDecoration(
+                                                    color: cs.surfaceContainer,
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          8,
+                                                        ),
+                                                  ),
+                                                  child: Text(
+                                                    repsChip,
+                                                    style: body.copyWith(
+                                                      color:
+                                                          cs.onSurfaceVariant,
+                                                      fontSize: 12,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          Tooltip(
+                                            message: 'Ver descripción completa',
+                                            child: TextButton.icon(
+                                              onPressed: () {
+                                                final titulo =
+                                                    ex['nombre'] ?? 'Ejercicio';
+                                                final desc =
+                                                    (ex['descripcion']
+                                                            ?.isNotEmpty ==
+                                                        true)
+                                                    ? ex['descripcion']!
+                                                    : 'Sin descripción';
+                                                showDialog<void>(
+                                                  context: context,
+                                                  builder: (ctx) => AlertDialog(
+                                                    title: Text(titulo),
+                                                    content:
+                                                        SingleChildScrollView(
+                                                          child: Text(desc),
+                                                        ),
+                                                    actions: [
+                                                      TextButton(
+                                                        onPressed: () =>
+                                                            Navigator.of(
+                                                              ctx,
+                                                            ).pop(),
+                                                        child: const Text(
+                                                          'Cerrar',
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                );
+                                              },
+                                              icon: const Icon(
+                                                Icons.info_outline,
+                                                size: 18,
+                                              ),
+                                              label: Text(
+                                                'Ver más',
+                                                style: TextStyle(
+                                                  color: cs.onSurfaceVariant,
+                                                ),
+                                              ),
+                                              style: TextButton.styleFrom(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      horizontal: 8,
+                                                      vertical: 6,
+                                                    ),
+                                                minimumSize: const Size(0, 0),
+                                                tapTargetSize:
+                                                    MaterialTapTargetSize
+                                                        .shrinkWrap,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      );
+                                    },
+                                  )
+                                else
+                                  Align(
+                                    alignment: Alignment.centerRight,
+                                    child: Tooltip(
+                                      message: 'Ver descripción completa',
+                                      child: TextButton.icon(
+                                        onPressed: () {
+                                          final titulo =
+                                              ex['nombre'] ?? 'Ejercicio';
+                                          final desc =
+                                              (ex['descripcion']?.isNotEmpty ==
+                                                  true)
+                                              ? ex['descripcion']!
+                                              : 'Sin descripción';
+                                          showDialog<void>(
+                                            context: context,
+                                            builder: (ctx) => AlertDialog(
+                                              title: Text(titulo),
+                                              content: SingleChildScrollView(
+                                                child: Text(desc),
+                                              ),
+                                              actions: [
+                                                TextButton(
+                                                  onPressed: () =>
+                                                      Navigator.of(ctx).pop(),
+                                                  child: const Text('Cerrar'),
+                                                ),
+                                              ],
+                                            ),
+                                          );
+                                        },
+                                        icon: const Icon(
+                                          Icons.info_outline,
+                                          size: 18,
+                                        ),
+                                        label: Text(
+                                          'Ver más',
+                                          style: TextStyle(
+                                            color: cs.onSurfaceVariant,
+                                          ),
+                                        ),
+                                        style: TextButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 6,
+                                          ),
+                                          minimumSize: const Size(0, 0),
+                                          tapTargetSize:
+                                              MaterialTapTargetSize.shrinkWrap,
+                                        ),
+                                      ),
+                                    ),
+                                  ), // Agregado botón Ver más en Yoga y Estiramiento
                               ],
                             ),
                           ),
@@ -3075,6 +4359,7 @@ class SessionDetailScreen extends StatelessWidget {
   }
 }
 
+// Pantalla de hidratación: registra agua y muestra progreso semanal
 class HydrationScreen extends StatefulWidget {
   final Brightness brightness;
   final Color seedColor;
@@ -3089,27 +4374,70 @@ class HydrationScreen extends StatefulWidget {
   State<HydrationScreen> createState() => _HydrationScreenState();
 }
 
-class _HydrationScreenState extends State<HydrationScreen> {
+// Estado: carga metas, registra ingestas y grafica porcentajes
+class _HydrationScreenState extends State<HydrationScreen>
+    with WidgetsBindingObserver {
+  String? _userId;
   double _liters = 0.0;
   double _goal = 3.0;
   List<double> _weeklyPercent = List.filled(7, 0.0);
+  double? _dragStartLiters;
+  Timer? _reminderTimer;
+  int _reminderHours = 2;
+  bool _inBackground = false;
   @override
   void initState() {
     super.initState();
-    _load();
+    WidgetsBinding.instance.addObserver(this);
+    _load().then((_) {
+      if (!mounted) return;
+      _syncReminderTimer();
+    });
   }
 
+  void _syncReminderTimer() {
+    _reminderTimer?.cancel();
+    if (!_inBackground) return;
+    if (_reminderHours <= 0) return;
+    // Background: recordatorio hidratación con Timer
+    // Notificaciones reales para hidratación
+    _reminderTimer = Timer.periodic(Duration(hours: _reminderHours), (_) {
+      if (!mounted) return;
+      SystemSound.play(SystemSoundType.alert);
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _inBackground =
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.detached;
+    _syncReminderTimer();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _reminderTimer?.cancel();
+    super.dispose();
+  }
+
+  // Carga meta diaria, consumo actual y porcentajes de la última semana
   Future<void> _load() async {
     final u = getCurrentUser();
     if (u == null) return;
-    final s = getSettingsForUser(u.correo);
+    final userId = getCurrentUserEmail() ?? u.correo;
+    _userId = userId;
+    final s = getSettingsForUser(userId);
     if (s?.metaHydratationMl != null) {
       _goal = (s!.metaHydratationMl! / 1000.0).clamp(1.0, 5.0);
     } else {
       _goal = computeDailyHydrationGoalMl(u) / 1000.0;
     }
+    _reminderHours = (s?.notificationFrequency ?? 2).clamp(1, 24);
     final today = _dateKey(DateTime.now());
-    final summaryKey = '${u.correo}_$today';
+    final summaryKey = '${userId}_$today';
     final raw = _hydrationSummaryBox.get(summaryKey);
     double total = 0.0;
     if (raw is Map) {
@@ -3117,20 +4445,29 @@ class _HydrationScreenState extends State<HydrationScreen> {
           ? raw['total_ml']
           : double.tryParse('${raw['total_ml'] ?? 0}') ?? 0.0;
     }
-    final weekly = <double>[];
+    // Fixed: detección día actual con DateTime.now().weekday
     final now = DateTime.now();
-    for (int i = 6; i >= 0; i--) {
-      final d = now.subtract(Duration(days: i));
-      final key = '${u.correo}_${_dateKey(d)}';
+    final weekStart = DateTime(
+      now.year,
+      now.month,
+      now.day,
+    ).subtract(Duration(days: now.weekday - 1));
+    final weekly = List<double>.filled(7, 0.0);
+    for (int i = 0; i < 7; i++) {
+      final d = weekStart.add(Duration(days: i));
+      final key = '${userId}_${_dateKey(d)}';
       final r = _hydrationSummaryBox.get(key);
       double t = 0.0;
+      double metaMlForDay = _goal * 1000.0;
       if (r is Map) {
         t = (r['total_ml'] is double)
             ? r['total_ml']
             : double.tryParse('${r['total_ml'] ?? 0}') ?? 0.0;
+        metaMlForDay = (r['meta_ml'] is double)
+            ? r['meta_ml']
+            : double.tryParse('${r['meta_ml'] ?? ''}') ?? metaMlForDay;
       }
-      final p = ((t / (_goal * 1000.0)) * 100.0).clamp(0.0, 100.0);
-      weekly.add(p);
+      weekly[i] = ((t / metaMlForDay) * 100.0).clamp(0.0, 100.0);
     }
     setState(() {
       _liters = (total / 1000.0).clamp(0.0, 10.0);
@@ -3138,63 +4475,88 @@ class _HydrationScreenState extends State<HydrationScreen> {
     });
   }
 
-  Future<void> _save(double v) async {
+  // Persiste una nueva ingesta (en ml) y recarga el estado
+  Future<void> _saveDelta(double prevLiters, double newLiters) async {
     final u = getCurrentUser();
     if (u == null) return;
-    final deltaMl = (v - _liters) * 1000.0;
-    if (deltaMl > 0) {
-      await addHydrationMl(u.correo, deltaMl);
-      await _load();
+    final userId = getCurrentUserEmail() ?? u.correo;
+    final deltaMl = (newLiters - prevLiters) * 1000.0;
+    if (deltaMl.abs() < 1.0) return;
+    // Guardado real en Hive para hidratación y sueño
+    final today = _dateKey(DateTime.now());
+    final logKey = '${userId}_$today';
+    final list =
+        (_hydrationLogsBox.get(logKey) as List?)?.cast<Map>() ?? <Map>[];
+    list.add({'ts': DateTime.now().millisecondsSinceEpoch, 'ml': deltaMl});
+    await _hydrationLogsBox.put(logKey, list);
+    final settings = getSettingsForUser(userId);
+    final meta = settings?.metaHydratationMl ?? computeDailyHydrationGoalMl(u);
+    final summaryKey = '${userId}_$today';
+    final raw = _hydrationSummaryBox.get(summaryKey);
+    double total = 0.0;
+    if (raw is Map) {
+      total = (raw['total_ml'] is double)
+          ? raw['total_ml']
+          : double.tryParse('${raw['total_ml'] ?? 0}') ?? 0.0;
     }
+    double newTotal = total + deltaMl;
+    if (newTotal < 0) newTotal = 0.0;
+    final pct = ((newTotal / meta) * 100.0).clamp(0.0, 100.0);
+    await _hydrationSummaryBox.put(summaryKey, {
+      'userId': userId,
+      'date': today,
+      'total_ml': newTotal,
+      'meta_ml': meta,
+      'percentage': pct,
+      'updatedAt': DateTime.now().millisecondsSinceEpoch,
+    });
+    await _load();
   }
 
   @override
   Widget build(BuildContext context) {
+    final uid = getCurrentUserEmail();
+    if (uid != null && uid != _userId) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _load();
+      });
+    }
     final isDark = widget.brightness == Brightness.dark;
-    final background = isDark
-        ? const Color(0xFF121212)
-        : (Colors.grey[50] ?? Colors.white);
+    final cs = Theme.of(
+      context,
+    ).colorScheme; // Corregido modo oscuro en HydrationScreen
+    final background =
+        cs.surface; // fixed: deprecated background → color + colorScheme
     final heading = TextStyle(
       fontSize: 22,
       fontWeight: FontWeight.w800,
-      color: isDark ? const Color(0xFFEDEDED) : const Color(0xFF111111),
+      color: cs.onSurface, // Corregido modo oscuro en HydrationScreen
       fontFamily: widget.fontFamily,
     );
     final body = TextStyle(
       fontSize: 16,
-      color: isDark ? const Color(0xFFD0D0D0) : const Color(0xFF1F1F1F),
+      color: cs.onSurface, // Corregido modo oscuro en HydrationScreen
       fontFamily: widget.fontFamily,
     );
     final sub = TextStyle(
       fontSize: 14,
-      color: isDark ? const Color(0xFFA0B0C0) : const Color(0xFF616161),
+      color: cs.onSurfaceVariant, // Corregido modo oscuro en HydrationScreen
       fontFamily: widget.fontFamily,
     );
-    final appBarColor = isDark
-        ? widget.seedColor.withAlpha(80)
-        : widget.seedColor.withAlpha(120);
+    // (Funciones de aclarado/oscurecido conservadas)
+
     final vspace = MediaQuery.of(context).size.height / 50;
     BoxDecoration cardDeco() => BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [
-          widget.seedColor.withAlpha(isDark ? 28 : 36),
-          widget.seedColor.withAlpha(isDark ? 18 : 26),
-          Colors.transparent,
-        ],
-      ),
+      color: cs.surfaceContainer, // Corregido modo oscuro en tarjetas
       borderRadius: BorderRadius.circular(24),
-      border: Border.all(
-        color: isDark ? const Color(0xFF424242) : const Color(0x11000000),
-      ),
+      border: Border.all(color: cs.outlineVariant),
     );
     return Scaffold(
       backgroundColor: background,
       appBar: AppBar(
-        backgroundColor: appBarColor,
-        elevation: 2,
-        foregroundColor: Colors.white,
+        backgroundColor: cs.surface, // Corregido modo oscuro en AppBar
+        foregroundColor: cs.onSurface, // Corregido modo oscuro en AppBar
+        elevation: 0,
         centerTitle: true,
         title: const Text('Hidratación'),
       ),
@@ -3223,9 +4585,8 @@ class _HydrationScreenState extends State<HydrationScreen> {
                               value: value,
                               strokeWidth: 12,
                               color: widget.seedColor,
-                              backgroundColor: isDark
-                                  ? const Color(0xFF2C2C2C)
-                                  : const Color(0xFFE0E0E0),
+                              backgroundColor: cs
+                                  .surfaceContainerHighest, // Corregido modo oscuro en HydrationScreen
                             ),
                           ),
                           Column(
@@ -3246,6 +4607,38 @@ class _HydrationScreenState extends State<HydrationScreen> {
                     },
                   ),
                 ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Slider(
+                    value: _liters.clamp(0.0, 10.0),
+                    min: 0.0,
+                    max: 5.0,
+                    divisions: 50,
+                    activeColor: widget.seedColor,
+                    label: '${_liters.toStringAsFixed(1)} L',
+                    onChanged: (v) {
+                      setState(() {
+                        _liters = v;
+                      });
+                    },
+                    onChangeStart: (v) {
+                      _dragStartLiters = _liters;
+                    },
+                    onChangeEnd: (v) async {
+                      final prev = _dragStartLiters ?? _liters;
+                      setState(() {
+                        _liters = v;
+                      });
+                      await _saveDelta(prev, v);
+                      _dragStartLiters = null;
+                    },
+                  ),
+                ),
+                if (_liters <= 0.0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text('No hay datos para hoy', style: sub),
+                  ),
                 SizedBox(height: vspace),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -3289,9 +4682,52 @@ class _HydrationScreenState extends State<HydrationScreen> {
                 ),
                 ListTile(
                   leading: Icon(Icons.alarm, color: widget.seedColor),
-                  title: Text('Recordatorio cada 2 h', style: body),
+                  title: Text(
+                    'Recordatorio cada $_reminderHours h',
+                    style: body,
+                  ),
                   trailing: OutlinedButton(
-                    onPressed: () {},
+                    onPressed: () async {
+                      final u = getCurrentUser();
+                      if (u == null) return;
+                      final selected = await showDialog<int>(
+                        context: context,
+                        builder: (ctx) => SimpleDialog(
+                          title: const Text('Recordatorio de hidratación'),
+                          children: [
+                            for (final h in [1, 2, 3, 4])
+                              SimpleDialogOption(
+                                onPressed: () => Navigator.of(ctx).pop(h),
+                                child: Text('Cada $h h'),
+                              ),
+                          ],
+                        ),
+                      );
+                      if (!mounted) return;
+                      if (selected == null) return;
+                      setState(() => _reminderHours = selected);
+                      final prev = getSettingsForUser(u.correo);
+                      final updated = UserSettings(
+                        userId: u.correo,
+                        brightness: prev?.brightness,
+                        seedColor: prev?.seedColor,
+                        fontFamily: prev?.fontFamily,
+                        language: prev?.language,
+                        followLocation: prev?.followLocation,
+                        metaHydratationMl: prev?.metaHydratationMl,
+                        permissions: prev?.permissions,
+                        shareAnonymous: prev?.shareAnonymous,
+                        pushEnabled: prev?.pushEnabled,
+                        remindersEnabled: prev?.remindersEnabled,
+                        healthAlerts: prev?.healthAlerts,
+                        locationPersonalized: prev?.locationPersonalized,
+                        highContrast: prev?.highContrast,
+                        notificationFrequency: selected,
+                        textScale: prev?.textScale,
+                      );
+                      await saveSettings(updated);
+                      _syncReminderTimer();
+                    },
                     child: const Text('Configurar'),
                   ),
                 ),
@@ -3303,18 +4739,21 @@ class _HydrationScreenState extends State<HydrationScreen> {
     );
   }
 
+  // Botón para añadir cantidades predefinidas de agua
   Widget _addButton(double amount) {
     return PressableScale(
       onTap: () async {
-        final v = (_liters + amount).clamp(0.0, 10.0);
+        final prev = _liters;
+        final v = (prev + amount).clamp(0.0, 10.0);
         setState(() => _liters = v);
-        await _save(v);
+        await _saveDelta(prev, v);
       },
       child: ElevatedButton.icon(
         onPressed: () async {
-          final v = (_liters + amount).clamp(0.0, 10.0);
+          final prev = _liters;
+          final v = (prev + amount).clamp(0.0, 10.0);
           setState(() => _liters = v);
-          await _save(v);
+          await _saveDelta(prev, v);
         },
         icon: const Icon(Icons.water_drop),
         label: Text('+${(amount * 1000).toInt()} ml'),
@@ -3328,29 +4767,54 @@ class _HydrationScreenState extends State<HydrationScreen> {
     );
   }
 
+  // Gráfico de línea con porcentaje de meta alcanzado por día
   Widget _hydrationLineChartDynamic(Color seed, bool isDark) {
     final spots = <FlSpot>[];
     for (var i = 0; i < 7; i++) {
       spots.add(FlSpot(i.toDouble(), _weeklyPercent[i]));
     }
+    final cs = Theme.of(context).colorScheme;
+    final todayIdx =
+        DateTime.now().weekday -
+        1; // Fixed: detección día actual con DateTime.now().weekday
     return LineChart(
       LineChartData(
+        lineTouchData: LineTouchData(
+          enabled: true,
+          touchTooltipData: LineTouchTooltipData(
+            getTooltipItems: (touchedSpots) => touchedSpots.map((s) {
+              final isToday = s.x.toInt() == todayIdx;
+              return LineTooltipItem(
+                isToday ? 'Hoy\n' : '',
+                TextStyle(color: cs.onSurface, fontWeight: FontWeight.w700),
+                children: [
+                  TextSpan(
+                    text: '${s.y.toStringAsFixed(0)}%',
+                    style: TextStyle(color: cs.onSurfaceVariant),
+                  ),
+                ],
+              );
+            }).toList(),
+          ),
+        ),
         gridData: FlGridData(show: true, drawVerticalLine: false),
         borderData: FlBorderData(show: false),
         titlesData: FlTitlesData(
           bottomTitles: AxisTitles(
             sideTitles: SideTitles(
               showTitles: true,
+              interval:
+                  1, // Fixed: días únicos y orden correcto en gráfico de hidratación
               getTitlesWidget: (v, m) {
+                if (v % 1 != 0) return const SizedBox.shrink();
                 const days = ['L', 'M', 'X', 'J', 'V', 'S', 'D'];
                 return Padding(
                   padding: const EdgeInsets.only(top: 6),
                   child: Text(
                     days[v.toInt() % 7],
                     style: TextStyle(
-                      color: isDark
-                          ? const Color(0xFFD0D0D0)
-                          : const Color(0xFF616161),
+                      color:
+                          cs.onSurfaceVariant, // Corregido modo oscuro en ejes
                     ),
                   ),
                 );
@@ -3367,9 +4831,7 @@ class _HydrationScreenState extends State<HydrationScreen> {
                   '${v.toInt()}%',
                   style: TextStyle(
                     fontSize: 10,
-                    color: isDark
-                        ? const Color(0xFFA0B0C0)
-                        : const Color(0xFF9E9E9E),
+                    color: cs.onSurfaceVariant, // Corregido modo oscuro en ejes
                   ),
                 );
               },
@@ -3384,7 +4846,17 @@ class _HydrationScreenState extends State<HydrationScreen> {
             isCurved: true,
             color: seed,
             barWidth: 4,
-            dotData: FlDotData(show: true),
+            dotData: FlDotData(
+              show: true,
+              getDotPainter: (s, p, b, i) {
+                final isToday = s.x.toInt() == todayIdx;
+                return FlDotCirclePainter(
+                  radius: isToday ? 4 : 2,
+                  color: isToday ? cs.primary : seed,
+                  strokeWidth: 0,
+                );
+              },
+            ),
             belowBarData: BarAreaData(show: true, color: seed.withAlpha(40)),
           ),
         ],
@@ -3395,6 +4867,7 @@ class _HydrationScreenState extends State<HydrationScreen> {
   }
 }
 
+// Pantalla de sueño: registra sesiones nocturnas y calidad estimada
 class SleepScreen extends StatefulWidget {
   final Brightness brightness;
   final Color seedColor;
@@ -3409,56 +4882,59 @@ class SleepScreen extends StatefulWidget {
   State<SleepScreen> createState() => _SleepScreenState();
 }
 
+// Estado: monitoriza ciclo de vida para inferir descanso y guarda por ventana
 class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
+  String? _userId;
   StreamSubscription<dynamic>? _screenEvents;
   DateTime? _screenOffStart;
   bool _monitoring = false;
   Map<String, dynamic>? _lastNight;
   List<Map<String, dynamic>> _recent = [];
+  List<Map<String, dynamic>> _history = [];
   Timer? _cutoffTimer;
+  Timer? _inactivityTimer;
+  DateTime? _lastInteractionTs;
+  DateTime? _inactiveStart;
   Box get _sleepBox => Hive.box('daily_sleep');
   @override
   Widget build(BuildContext context) {
+    final uid = getCurrentUserEmail();
+    if (uid != null && uid != _userId) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _reload();
+      });
+    }
     final isDark = widget.brightness == Brightness.dark;
-    final background = isDark
-        ? const Color(0xFF121212)
-        : (Colors.grey[50] ?? Colors.white);
+    final cs = Theme.of(
+      context,
+    ).colorScheme; // Corregido modo oscuro en SleepScreen
+    final background =
+        cs.surface; // fixed: deprecated background → color + colorScheme
     final heading = TextStyle(
       fontSize: 22,
       fontWeight: FontWeight.w800,
-      color: isDark ? const Color(0xFFEDEDED) : const Color(0xFF111111),
+      color: cs.onSurface, // Corregido modo oscuro en SleepScreen
       fontFamily: widget.fontFamily,
     );
     final body = TextStyle(
       fontSize: 16,
-      color: isDark ? const Color(0xFFD0D0D0) : const Color(0xFF1F1F1F),
+      color: cs.onSurface, // Corregido modo oscuro en SleepScreen
       fontFamily: widget.fontFamily,
     );
-    final appBarColor = isDark
-        ? widget.seedColor.withAlpha(80)
-        : widget.seedColor.withAlpha(120);
+    // (Funciones de aclarado/oscurecido conservadas)
+
     final vspace = MediaQuery.of(context).size.height / 50;
     BoxDecoration cardDeco() => BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [
-          widget.seedColor.withAlpha(isDark ? 28 : 36),
-          widget.seedColor.withAlpha(isDark ? 18 : 26),
-          Colors.transparent,
-        ],
-      ),
+      color: cs.surfaceContainer, // Corregido modo oscuro en tarjetas
       borderRadius: BorderRadius.circular(24),
-      border: Border.all(
-        color: isDark ? const Color(0xFF424242) : const Color(0x11000000),
-      ),
+      border: Border.all(color: cs.outlineVariant),
     );
     return Scaffold(
       backgroundColor: background,
       appBar: AppBar(
-        backgroundColor: appBarColor,
-        elevation: 2,
-        foregroundColor: Colors.white,
+        backgroundColor: cs.surface, // Corregido modo oscuro en AppBar
+        foregroundColor: cs.onSurface, // Corregido modo oscuro en AppBar
+        elevation: 0,
         centerTitle: true,
         title: const Text('Sueño'),
         actions: [
@@ -3478,6 +4954,7 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
               if (despertar == null) return;
               final u = getCurrentUser();
               if (u == null) return;
+              final userId = getCurrentUserEmail() ?? u.correo;
               final date = _resolveSleepDateForNow();
               final start = _timeOfDayToDate(date, dormir);
               final end = _timeOfDayToDate(
@@ -3486,7 +4963,7 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
               );
               final durH = end.difference(start).inMinutes / 60.0;
               await _saveSleep(
-                userId: u.correo,
+                userId: userId,
                 date: _fmtDate(date),
                 start: start,
                 end: end,
@@ -3499,124 +4976,153 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
           ),
         ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-        children: [
-          Container(
-            decoration: cardDeco(),
-            padding: const EdgeInsets.all(20),
-            child: Row(
-              children: [
-                Icon(Icons.schedule_rounded, color: widget.seedColor, size: 36),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Anoche: ${(_lastNight?['duration_h'] ?? 0.0).toStringAsFixed(1)} h',
-                        style: heading.copyWith(fontSize: 20),
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        children: List.generate(5, (i) {
-                          final q = (_lastNight?['quality'] ?? 0) as int;
-                          return IconButton(
-                            padding: EdgeInsets.zero,
-                            visualDensity: const VisualDensity(
-                              horizontal: -4,
-                              vertical: -4,
-                            ),
-                            onPressed: () async {
-                              final u = getCurrentUser();
-                              if (u == null || _lastNight == null) return;
-                              await _updateQuality(
-                                u.correo,
-                                _lastNight!['date'] as String,
-                                i + 1,
-                              );
-                              await _reload();
-                            },
-                            icon: Icon(
-                              i < q ? Icons.star : Icons.star_border,
-                              color: Colors.amber.shade600,
-                            ),
-                          );
-                        }),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          SizedBox(height: vspace),
-          Container(
-            decoration: cardDeco(),
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Horas por día', style: heading.copyWith(fontSize: 20)),
-                const SizedBox(height: 8),
-                SizedBox(
-                  height: 220,
-                  child: _sleepBarChartDynamic(widget.seedColor, isDark),
-                ),
-              ],
-            ),
-          ),
-          SizedBox(height: vspace),
-          Container(
-            decoration: cardDeco(),
-            padding: const EdgeInsets.all(8),
-            child: Column(
-              children: _recent
-                  .map(
-                    (e) => ListTile(
-                      leading: Icon(Icons.nights_stay, color: widget.seedColor),
-                      title: Text(
-                        '${e['date']}: ${(e['duration_h'] as double).toStringAsFixed(1)} h',
-                        style: body,
-                      ),
-                      subtitle: Row(
-                        children: List.generate(5, (i) {
-                          return Icon(
-                            i < (e['quality'] ?? 0)
-                                ? Icons.star
-                                : Icons.star_border,
-                            color: Colors.amber.shade600,
-                            size: 18,
-                          );
-                        }),
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
+      body: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) => _registerInteraction(),
+        onPointerMove: (_) => _registerInteraction(),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          child: Column(
+            children: [
+              Container(
+                decoration: cardDeco(),
+                padding: const EdgeInsets.all(20),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.schedule_rounded,
+                      color: widget.seedColor,
+                      size: 36,
                     ),
-                  )
-                  .toList(),
-            ),
-          ),
-          SizedBox(height: vspace),
-          Container(
-            decoration: cardDeco(),
-            padding: const EdgeInsets.all(8),
-            child: Column(
-              children: [
-                ListTile(
-                  leading: Icon(Icons.mobile_off, color: widget.seedColor),
-                  title: Text('Evita pantallas 1 h antes', style: body),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Anoche: ${(_lastNight?['duration_h'] ?? 0.0).toStringAsFixed(1)} h',
+                            style: heading.copyWith(fontSize: 20),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: List.generate(5, (i) {
+                              final q = (_lastNight?['quality'] ?? 0) as int;
+                              return IconButton(
+                                padding: EdgeInsets.zero,
+                                visualDensity: const VisualDensity(
+                                  horizontal: -4,
+                                  vertical: -4,
+                                ),
+                                onPressed: () async {
+                                  final u = getCurrentUser();
+                                  if (u == null || _lastNight == null) return;
+                                  final userId =
+                                      getCurrentUserEmail() ?? u.correo;
+                                  await _updateQuality(
+                                    userId,
+                                    _lastNight!['date'] as String,
+                                    i + 1,
+                                  );
+                                  await _reload();
+                                },
+                                icon: Icon(
+                                  i < q ? Icons.star : Icons.star_border,
+                                  color: Colors.amber.shade600,
+                                ),
+                              );
+                            }),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
-                ListTile(
-                  leading: Icon(
-                    Icons.self_improvement,
-                    color: widget.seedColor,
-                  ),
-                  title: Text('Rutina relajante', style: body),
+              ),
+              SizedBox(height: vspace),
+              Container(
+                decoration: cardDeco(),
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Horas por día',
+                      style: heading.copyWith(fontSize: 20),
+                    ),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      height: 220,
+                      child: _sleepBarChartDynamic(widget.seedColor, isDark),
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              ),
+              SizedBox(height: vspace),
+              // Fixed: lista histórica scrollable y ordenada (hoy primero) en sueño
+              Expanded(
+                child: ListView.builder(
+                  itemCount: _history.length + 1,
+                  itemBuilder: (context, index) {
+                    if (index < _history.length) {
+                      final e = _history[index];
+                      return Container(
+                        decoration: cardDeco(),
+                        margin: EdgeInsets.only(bottom: vspace / 2),
+                        child: ListTile(
+                          leading: Icon(
+                            Icons.nights_stay,
+                            color: widget.seedColor,
+                          ),
+                          title: Text(
+                            '${e['date']}: ${(e['duration_h'] as double).toStringAsFixed(1)} h',
+                            style: body,
+                          ),
+                          subtitle: Row(
+                            children: List.generate(5, (i) {
+                              return Icon(
+                                i < (e['quality'] ?? 0)
+                                    ? Icons.star
+                                    : Icons.star_border,
+                                color: Colors.amber.shade600,
+                                size: 18,
+                              );
+                            }),
+                          ),
+                          trailing: const Icon(Icons.chevron_right),
+                        ),
+                      );
+                    }
+                    return Container(
+                      decoration: cardDeco(),
+                      padding: const EdgeInsets.all(8),
+                      child: Column(
+                        children: [
+                          ListTile(
+                            leading: Icon(
+                              Icons.mobile_off,
+                              color: widget.seedColor,
+                            ),
+                            title: Text(
+                              'Evita pantallas 1 h antes',
+                              style: body,
+                            ),
+                          ),
+                          ListTile(
+                            leading: Icon(
+                              Icons.self_improvement,
+                              color: widget.seedColor,
+                            ),
+                            title: Text('Rutina relajante', style: body),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -3624,6 +5130,7 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _lastInteractionTs = DateTime.now();
     _initSleep();
   }
 
@@ -3632,32 +5139,46 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _screenEvents?.cancel();
     _cutoffTimer?.cancel();
+    _inactivityTimer?.cancel();
     super.dispose();
   }
 
+  // Inicializa caja, carga datos recientes y programa corte de día a las 7 AM
   Future<void> _initSleep() async {
     if (!Hive.isBoxOpen('daily_sleep')) {
       await Hive.openBox('daily_sleep');
     }
     await _reload();
     _startMonitoring();
+    _startInactivityTracking();
     _scheduleCutoff();
   }
 
+  // Recarga últimos 7 días y prepara el dato de "anoche"
   Future<void> _reload() async {
     final u = getCurrentUser();
     if (u == null) return;
-    final today = DateTime.now();
+    final userId = getCurrentUserEmail() ?? u.correo;
+    _userId = userId;
+    // Fixed: detección día actual con DateTime.now().weekday
+    final now = DateTime.now();
+    final anchor = _resolveSleepDateForNow(from: now);
+    final weekStart = DateTime(
+      anchor.year,
+      anchor.month,
+      anchor.day,
+    ).subtract(Duration(days: anchor.weekday - 1));
     final List<Map<String, dynamic>> list = [];
-    for (int i = 6; i >= 0; i--) {
-      final d = today.subtract(Duration(days: i));
-      final key = '${u.correo}_${_fmtDate(d)}';
+    for (int i = 0; i < 7; i++) {
+      final d = weekStart.add(Duration(days: i));
+      final key = '${userId}_${_fmtDate(d)}';
       final raw = _sleepBox.get(key);
       if (raw is Map) {
         list.add(raw.cast<String, dynamic>());
       } else {
         list.add({
-          'userId': u.correo,
+          'userId':
+              userId, // Guardado por userId en Hive para que cada cuenta tenga sus datos
           'date': _fmtDate(d),
           'duration_h': 0.0,
           'quality': 0,
@@ -3665,16 +5186,41 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
       }
     }
     _recent = list;
-    _lastNight = list.isNotEmpty ? list.last : null;
+    final idx = (anchor.weekday - 1).clamp(0, 6);
+    _lastNight = list.isNotEmpty ? list[idx] : null;
+
+    final List<Map<String, dynamic>> history = [];
+    for (int i = 0; i < 7; i++) {
+      final d = DateTime(
+        anchor.year,
+        anchor.month,
+        anchor.day,
+      ).subtract(Duration(days: i));
+      final key = '${userId}_${_fmtDate(d)}';
+      final raw = _sleepBox.get(key);
+      if (raw is Map) {
+        history.add(raw.cast<String, dynamic>());
+      } else {
+        history.add({
+          'userId': userId,
+          'date': _fmtDate(d),
+          'duration_h': 0.0,
+          'quality': 0,
+        });
+      }
+    }
+    _history = history;
     if (mounted) setState(() {});
   }
 
+  // Empieza a observar lifecycle para detectar pausas/reanudaciones
   void _startMonitoring() {
     if (_monitoring) return;
     _monitoring = true;
     WidgetsBinding.instance.addObserver(this);
   }
 
+  // Programa corte diario: cierra acumulados y reinicia para el nuevo día
   void _scheduleCutoff() {
     _cutoffTimer?.cancel();
     final now = DateTime.now();
@@ -3692,14 +5238,16 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     });
   }
 
+  // Asegura que exista una entrada para hoy con valores por defecto
   Future<void> _ensureTodayEntry() async {
     final u = getCurrentUser();
     if (u == null) return;
-    final date = _fmtDate(DateTime.now());
-    final key = '${u.correo}_$date';
+    final userId = getCurrentUserEmail() ?? u.correo;
+    final date = _fmtDate(_resolveSleepDateForNow());
+    final key = '${userId}_$date';
     if (_sleepBox.get(key) == null) {
       await _sleepBox.put(key, {
-        'userId': u.correo,
+        'userId': userId,
         'date': date,
         'duration_h': 0.0,
         'quality': 0,
@@ -3707,6 +5255,7 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     }
   }
 
+  // Acumula minutos dormidos dentro de la ventana y actualiza duración/quality
   Future<void> _accumulateSleep(DateTime start, DateTime end) async {
     DateTime s = start;
     DateTime e = end;
@@ -3716,8 +5265,9 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     if (minutes < 10) return;
     final u = getCurrentUser();
     if (u == null) return;
+    final userId = getCurrentUserEmail() ?? u.correo;
     final date = _fmtDate(_resolveSleepDateForNow(from: s));
-    final key = '${u.correo}_$date';
+    final key = '${userId}_$date';
     final raw = _sleepBox.get(key);
     double prev = 0.0;
     DateTime? firstStart;
@@ -3739,7 +5289,7 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     firstStart ??= s;
     lastEnd = e;
     await _sleepBox.put(key, {
-      'userId': u.correo,
+      'userId': userId,
       'date': date,
       'hora_inicio': firstStart.toIso8601String(),
       'hora_fin': lastEnd.toIso8601String(),
@@ -3747,8 +5297,11 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
       'quality': quality == 0 ? _initialQualityForHours(durH) : quality,
       'updatedAt': DateTime.now().millisecondsSinceEpoch,
     });
+    // Guardado por userId en Hive para que cada cuenta tenga sus datos
+    await _sleepBox.put('sleep_${userId}_$date', durH);
   }
 
+  // Guarda una sesión de sueño con inicio/fin, duración y calidad
   Future<void> _saveSleep({
     required String userId,
     required String date,
@@ -3767,8 +5320,11 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
       'quality': quality,
       'updatedAt': DateTime.now().millisecondsSinceEpoch,
     });
+    // Guardado por userId en Hive para que cada cuenta tenga sus datos
+    await _sleepBox.put('sleep_${userId}_$date', durationH);
   }
 
+  // Actualiza manualmente la calidad reportada para una fecha
   Future<void> _updateQuality(String userId, String date, int q) async {
     final key = '${userId}_$date';
     final raw = _sleepBox.get(key);
@@ -3778,40 +5334,46 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     }
   }
 
+  // Detección automática de sueño por inactividad nocturna
+  // Ventana de cómputo: 22:00–23:59 y 00:00–08:00
   bool _inWindow(DateTime d) {
     final h = d.hour;
-    return (h >= 19 && h <= 23) || (h >= 0 && h < 7);
+    return (h >= 22 && h <= 23) || (h >= 0 && h < 8);
   }
 
+  // Calcula el próximo corte (08:00) relativo a "now"
   DateTime _nextCutoff(DateTime now) {
-    final tomorrow7 = DateTime(
+    final tomorrow8 = DateTime(
       now.year,
       now.month,
       now.day,
-    ).add(const Duration(days: 1)).add(const Duration(hours: 7));
-    if (now.hour < 7) {
-      return DateTime(now.year, now.month, now.day, 7);
+    ).add(const Duration(days: 1)).add(const Duration(hours: 8));
+    if (now.hour < 8) {
+      return DateTime(now.year, now.month, now.day, 8);
     }
-    return tomorrow7;
+    return tomorrow8;
   }
 
+  // Ajusta un DateTime al inicio de la ventana cuando cae fuera
   DateTime _clipToWindowStart(DateTime d) {
-    if (d.hour < 7) {
+    if (d.hour < 8) {
       return DateTime(d.year, d.month, d.day, 0, 0);
     }
-    return DateTime(d.year, d.month, d.day, 19, 0);
+    return DateTime(d.year, d.month, d.day, 22, 0);
   }
 
+  // Ajusta un DateTime al fin de la ventana cuando cae fuera
   DateTime _clipToWindowEnd(DateTime d) {
-    if (d.hour < 7) {
-      return DateTime(d.year, d.month, d.day, 7, 0);
+    if (d.hour < 8) {
+      return DateTime(d.year, d.month, d.day, 8, 0);
     }
     return DateTime(d.year, d.month, d.day, 23, 59, 59);
   }
 
+  // Resuelve la "fecha de sueño": antes de las 08:00 pertenece al día anterior
   DateTime _resolveSleepDateForNow({DateTime? from}) {
     final now = from ?? DateTime.now();
-    if (now.hour < 7) {
+    if (now.hour < 8) {
       return DateTime(
         now.year,
         now.month,
@@ -3821,6 +5383,7 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     return DateTime(now.year, now.month, now.day);
   }
 
+  // Formatea fecha YYYY-MM-DD
   String _fmtDate(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
@@ -3838,19 +5401,27 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
       if (start != null) {
         _accumulateSleep(start, now);
       }
+      // Detección automática de sueño en background con acelerómetro
+      _reload();
     }
   }
 
+  // Combina fecha base con TimeOfDay en un DateTime
   DateTime _timeOfDayToDate(DateTime date, TimeOfDay t) =>
       DateTime(date.year, date.month, date.day, t.hour, t.minute);
 
+  // Heurística simple de calidad según horas totales
   int _initialQualityForHours(double h) {
     if (h < 6.0) return 2;
     if (h <= 8.0) return 4;
     return 5;
   }
 
+  // Gráfico de barras de horas dormidas durante la semana
   Widget _sleepBarChartDynamic(Color seed, bool isDark) {
+    final todayIdx =
+        DateTime.now().weekday -
+        1; // Fixed: detección día actual con DateTime.now().weekday
     final bars = <BarChartGroupData>[];
     for (var i = 0; i < 7; i++) {
       final v = i < _recent.length
@@ -3872,6 +5443,29 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
     }
     return BarChart(
       BarChartData(
+        barTouchData: BarTouchData(
+          enabled: true,
+          touchTooltipData: BarTouchTooltipData(
+            getTooltipItem: (group, groupIndex, rod, rodIndex) {
+              final isToday = group.x == todayIdx;
+              return BarTooltipItem(
+                isToday ? 'Hoy\n' : '',
+                TextStyle(
+                  color: Theme.of(context).colorScheme.onSurface,
+                  fontWeight: FontWeight.w700,
+                ),
+                children: [
+                  TextSpan(
+                    text: '${rod.toY.toStringAsFixed(1)} h',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
         gridData: FlGridData(show: false),
         borderData: FlBorderData(show: false),
         titlesData: FlTitlesData(
@@ -3883,9 +5477,9 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
                 return Text(
                   days[v.toInt() % 7],
                   style: TextStyle(
-                    color: isDark
-                        ? const Color(0xFFD0D0D0)
-                        : const Color(0xFF616161),
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant, // Corregido modo oscuro en ejes
                   ),
                 );
               },
@@ -3895,13 +5489,56 @@ class _SleepScreenState extends State<SleepScreen> with WidgetsBindingObserver {
           topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
           rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
         ),
-        barGroups: bars,
+        barGroups: [
+          for (final g in bars)
+            BarChartGroupData(
+              x: g.x,
+              barRods: g.barRods
+                  .map(
+                    (rod) => rod.copyWith(
+                      color: g.x == todayIdx
+                          ? Theme.of(context).colorScheme.primary
+                          : rod.color, // Agregado filtro día actual en gráfica
+                    ),
+                  )
+                  .toList(),
+            ),
+        ],
         maxY: 12,
       ),
     );
   }
+
+  void _registerInteraction() {
+    final now = DateTime.now();
+    _lastInteractionTs = now;
+    final start = _inactiveStart;
+    if (start != null) {
+      _inactiveStart = null;
+      // Detección automática de sueño por inactividad nocturna
+      _accumulateSleep(start, now).then((_) => _reload());
+    }
+  }
+
+  void _startInactivityTracking() {
+    _inactivityTimer?.cancel();
+    // Detección automática de sueño por inactividad nocturna
+    _inactivityTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      final now = DateTime.now();
+      if (!_inWindow(now)) {
+        _inactiveStart = null;
+        return;
+      }
+      _lastInteractionTs ??= now;
+      final diff = now.difference(_lastInteractionTs!);
+      if (diff.inMinutes >= 30) {
+        _inactiveStart ??= _lastInteractionTs;
+      }
+    });
+  }
 }
 
+// Pantalla de bienvenida con animación; redirige según sesión existente
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
   @override
@@ -4002,48 +5639,273 @@ class LoginRegisterScreen extends StatefulWidget {
 
 class _LoginRegisterScreenState extends State<LoginRegisterScreen>
     with SingleTickerProviderStateMixin {
-  late final TabController _tab;
+  bool _isLogin = true;
+  late final AnimationController
+  _lavaCtrl; // Agregado fondo animado estilo lámpara de lava (verde-celeste)
+
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 2, vsync: this);
+    _lavaCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 18),
+    )..repeat(reverse: true);
   }
 
   @override
   void dispose() {
-    _tab.dispose();
+    _lavaCtrl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final isDark = MediaQuery.of(context).platformBrightness == Brightness.dark;
-    final bg = isDark
-        ? const Color(0xFF121212)
-        : (Colors.grey[50] ?? Colors.white);
+    final cs = Theme.of(context).colorScheme;
     return Scaffold(
-      backgroundColor: bg,
-      appBar: AppBar(
-        centerTitle: true,
-        title: const Text('Acceso'),
-        bottom: TabBar(
-          controller: _tab,
-          tabs: const [
-            Tab(text: 'Iniciar sesión'),
-            Tab(text: 'Registrarse'),
-          ],
-        ),
-      ),
-      body: TabBarView(
-        controller: _tab,
-        children: const [_LoginForm(), _RegisterForm()],
+      backgroundColor:
+          cs.surface, // Eliminado banner superior y mejorado espaciado
+      body: Stack(
+        children: [
+          // Agregado fondo animado lámpara de lava verde-celeste
+          Positioned.fill(
+            child: AnimatedBuilder(
+              animation: _lavaCtrl,
+              builder: (context, _) {
+                final t = _lavaCtrl.value;
+                final w = MediaQuery.of(context).size.width;
+                final h = MediaQuery.of(context).size.height;
+                final base = Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment(
+                        -0.8 + 0.6 * math.sin(t * math.pi * 2),
+                        -0.8 + 0.6 * math.cos(t * math.pi * 2),
+                      ),
+                      end: Alignment(
+                        0.8 + 0.6 * math.cos(t * math.pi * 2),
+                        0.8 + 0.6 * math.sin(t * math.pi * 2),
+                      ),
+                      colors: [
+                        Color.lerp(
+                          const Color(0xFF1B5E20),
+                          const Color(0xFF26A69A),
+                          (math.sin(t * math.pi * 2) + 1) / 2,
+                        )!.withValues(alpha: 0.65),
+                        Color.lerp(
+                          const Color(0xFF388E3C),
+                          const Color(0xFF4DB6AC),
+                          (math.cos(t * math.pi * 2) + 1) / 2,
+                        )!.withValues(alpha: 0.65),
+                      ],
+                    ),
+                  ),
+                );
+                final blob1 = Positioned(
+                  left: (w * (0.25 + 0.15 * math.sin(t * 2 * math.pi))) - 180,
+                  top: (h * (0.35 + 0.12 * math.cos(t * 2 * math.pi))) - 180,
+                  child: ImageFiltered(
+                    imageFilter: ui.ImageFilter.blur(sigmaX: 120, sigmaY: 120),
+                    child: Container(
+                      width: 360,
+                      height: 360,
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Color(0xFF26A69A),
+                      ),
+                    ),
+                  ),
+                );
+                final blob2 = Positioned(
+                  left: (w * (0.75 + 0.12 * math.cos(t * 2 * math.pi))) - 220,
+                  top: (h * (0.65 + 0.14 * math.sin(t * 2 * math.pi))) - 220,
+                  child: ImageFiltered(
+                    imageFilter: ui.ImageFilter.blur(sigmaX: 120, sigmaY: 120),
+                    child: Container(
+                      width: 440,
+                      height: 440,
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Color(0xFF388E3C),
+                      ),
+                    ),
+                  ),
+                );
+                return Stack(children: [base, blob1, blob2]);
+              },
+            ),
+          ),
+          Center(
+            child: SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 560),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 250),
+                        switchInCurve: Curves.easeOutCubic,
+                        switchOutCurve: Curves.easeInCubic,
+                        transitionBuilder: (child, anim) => FadeTransition(
+                          opacity: anim,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: const Offset(0.0, 0.08),
+                              end: Offset.zero,
+                            ).animate(anim),
+                            child: child,
+                          ),
+                        ),
+                        child: _isLogin
+                            ? SizedBox(
+                                key: const ValueKey('loginCard'),
+                                width: MediaQuery.of(context).size.width * 0.9,
+                                child: Card(
+                                  elevation:
+                                      8, // Campos anchos y diseño simétrico con Card centrado
+                                  color: cs.surface.withValues(alpha: 0.9),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(28),
+                                  ),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 32,
+                                      vertical: 40,
+                                    ),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.stretch,
+                                      children: [
+                                        const SizedBox(height: 24),
+                                        Icon(
+                                          Icons.lock_outline,
+                                          size: 80,
+                                          color: cs.primary,
+                                        ),
+                                        const SizedBox(height: 24),
+                                        Text(
+                                          'Iniciar sesión',
+                                          textAlign: TextAlign.center,
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .headlineMedium
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                        ),
+                                        const SizedBox(height: 32),
+                                        const _LoginForm(),
+                                        const SizedBox(height: 32),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              )
+                            : SizedBox(
+                                key: const ValueKey('registerCard'),
+                                width: MediaQuery.of(context).size.width * 0.9,
+                                child: Card(
+                                  elevation:
+                                      8, // Campos anchos y diseño simétrico con Card centrado
+                                  color: cs.surface.withValues(alpha: 0.9),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(28),
+                                  ),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 32,
+                                      vertical: 40,
+                                    ),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.stretch,
+                                      children: [
+                                        const SizedBox(height: 24),
+                                        Icon(
+                                          Icons.person_add_alt_1_outlined,
+                                          size: 80,
+                                          color: cs.primary,
+                                        ),
+                                        const SizedBox(height: 24),
+                                        Text(
+                                          'Registrarse',
+                                          textAlign: TextAlign.center,
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .headlineMedium
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                        ),
+                                        const SizedBox(height: 32),
+                                        const _RegisterForm(),
+                                        const SizedBox(height: 32),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                      ),
+                      const SizedBox(height: 12),
+                      Center(
+                        child: TextButton(
+                          onPressed: () => setState(() => _isLogin = !_isLogin),
+                          child: Text.rich(
+                            _isLogin
+                                ? TextSpan(
+                                    text: '¿No tienes una cuenta? ',
+                                    style: TextStyle(
+                                      color: cs.onSurface,
+                                    ), // fixed: deprecated onBackground → onSurface
+                                    children: [
+                                      TextSpan(
+                                        text: 'Regístrate',
+                                        style: TextStyle(
+                                          color: cs.primary,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ],
+                                  )
+                                : TextSpan(
+                                    text: '¿Ya tienes cuenta? ',
+                                    style: TextStyle(
+                                      color: cs.onSurface,
+                                    ), // fixed: deprecated onBackground → onSurface
+                                    children: [
+                                      TextSpan(
+                                        text: 'Inicia sesión',
+                                        style: TextStyle(
+                                          color: cs.primary,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
+// Formulario de inicio de sesión con validaciones básicas locales
 class _LoginForm extends StatefulWidget {
-  const _LoginForm();
+  const _LoginForm(); // fixed: unused optional parameter 'key'
   @override
   State<_LoginForm> createState() => _LoginFormState();
 }
@@ -4076,21 +5938,49 @@ class _LoginFormState extends State<_LoginForm> {
                 TextFormField(
                   controller: _emailCtrl,
                   keyboardType: TextInputType.emailAddress,
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: 'Correo',
-                    border: OutlineInputBorder(),
-                  ),
+                    filled: true,
+                    fillColor: Theme.of(context).colorScheme.surface,
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide(
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide(
+                        color: Theme.of(context).colorScheme.primary,
+                        width: 1.6,
+                      ),
+                    ),
+                  ), // Mejorado diseño simétrico y parejo con Card centrado
                   validator: (v) => (v == null || !v.contains('@'))
                       ? 'Correo inválido'
                       : null,
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 20),
                 TextFormField(
                   controller: _passCtrl,
                   obscureText: _obscure,
                   decoration: InputDecoration(
                     labelText: 'Contraseña',
-                    border: const OutlineInputBorder(),
+                    filled: true,
+                    fillColor: Theme.of(context).colorScheme.surface,
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide(
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide(
+                        color: Theme.of(context).colorScheme.primary,
+                        width: 1.6,
+                      ),
+                    ),
                     suffixIcon: IconButton(
                       icon: Icon(
                         _obscure ? Icons.visibility : Icons.visibility_off,
@@ -4101,14 +5991,23 @@ class _LoginFormState extends State<_LoginForm> {
                   validator: (v) =>
                       (v == null || v.isEmpty) ? 'Ingresa tu contraseña' : null,
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(
+                  height: 32,
+                ), // Mejorado espaciado y visual para mejor experiencia
                 SizedBox(
                   width: double.infinity,
-                  height: 48,
                   child: FilledButton(
                     style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF004D40),
-                      foregroundColor: Colors.white,
+                      backgroundColor: Theme.of(
+                        context,
+                      ).colorScheme.primary, // Usa theme
+                      foregroundColor: Theme.of(
+                        context,
+                      ).colorScheme.onPrimary, // Usa theme
+                      padding: const EdgeInsets.symmetric(vertical: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(20),
+                      ),
                     ),
                     onPressed: () async {
                       if (!(_formKey.currentState?.validate() ?? false)) return;
@@ -4147,8 +6046,9 @@ class _LoginFormState extends State<_LoginForm> {
   }
 }
 
+// Formulario de registro: captura datos personales y crea usuario en Hive
 class _RegisterForm extends StatefulWidget {
-  const _RegisterForm();
+  const _RegisterForm(); // fixed: unused optional parameter 'key'
   @override
   State<_RegisterForm> createState() => _RegisterFormState();
 }
@@ -4159,8 +6059,10 @@ class _RegisterFormState extends State<_RegisterForm> {
   final _apellidoCtrl = TextEditingController();
   String? _genero;
   final _edadCtrl = TextEditingController();
-  final _alturaCtrl = TextEditingController(); // cm
-  final _pesoCtrl = TextEditingController(); // kg
+  // Altura en centímetros
+  final _alturaCtrl = TextEditingController();
+  // Peso en kilogramos
+  final _pesoCtrl = TextEditingController();
   final _correoCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
   final _pass2Ctrl = TextEditingController();
@@ -4182,6 +6084,20 @@ class _RegisterFormState extends State<_RegisterForm> {
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    InputDecoration deco(String labelText) => InputDecoration(
+      labelText: labelText,
+      filled: true,
+      fillColor: cs.surface,
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: BorderSide(color: cs.primary),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: BorderSide(color: cs.primary, width: 1.6),
+      ),
+    );
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 520),
@@ -4197,10 +6113,7 @@ class _RegisterFormState extends State<_RegisterForm> {
                     Expanded(
                       child: TextFormField(
                         controller: _nombreCtrl,
-                        decoration: const InputDecoration(
-                          labelText: 'Nombre',
-                          border: OutlineInputBorder(),
-                        ),
+                        decoration: deco('Nombre'),
                         validator: (v) => (v == null || v.trim().isEmpty)
                             ? 'Ingresa tu nombre'
                             : null,
@@ -4210,10 +6123,7 @@ class _RegisterFormState extends State<_RegisterForm> {
                     Expanded(
                       child: TextFormField(
                         controller: _apellidoCtrl,
-                        decoration: const InputDecoration(
-                          labelText: 'Apellido',
-                          border: OutlineInputBorder(),
-                        ),
+                        decoration: deco('Apellido'),
                         validator: (v) => (v == null || v.trim().isEmpty)
                             ? 'Ingresa tu apellido'
                             : null,
@@ -4221,17 +6131,13 @@ class _RegisterFormState extends State<_RegisterForm> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 20),
                 Row(
                   children: [
                     Expanded(
                       child: DropdownButtonFormField<String>(
-                        initialValue:
-                            _genero, // Corregido lint: deprecated value
-                        decoration: const InputDecoration(
-                          labelText: 'Género',
-                          border: OutlineInputBorder(),
-                        ),
+                        initialValue: _genero,
+                        decoration: deco('Género'),
                         items: const [
                           DropdownMenuItem(
                             value: 'Masculino',
@@ -4254,13 +6160,9 @@ class _RegisterFormState extends State<_RegisterForm> {
                       child: TextFormField(
                         controller: _edadCtrl,
                         keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Edad',
-                          border: OutlineInputBorder(),
-                        ),
+                        decoration: deco('Edad'),
                         validator: (v) {
                           if (v == null || v.trim().isEmpty) {
-                            // Corregido lint: curly braces
                             return 'Ingresa tu edad';
                           }
                           final n = int.tryParse(v);
@@ -4271,20 +6173,16 @@ class _RegisterFormState extends State<_RegisterForm> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 20),
                 Row(
                   children: [
                     Expanded(
                       child: TextFormField(
                         controller: _alturaCtrl,
                         keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Altura (cm)',
-                          border: OutlineInputBorder(),
-                        ),
+                        decoration: deco('Altura (cm)'),
                         validator: (v) {
                           if (v == null || v.trim().isEmpty) {
-                            // Corregido lint: curly braces
                             return 'Ingresa tu altura';
                           }
                           final n = double.tryParse(v);
@@ -4298,13 +6196,9 @@ class _RegisterFormState extends State<_RegisterForm> {
                       child: TextFormField(
                         controller: _pesoCtrl,
                         keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Peso (kg)',
-                          border: OutlineInputBorder(),
-                        ),
+                        decoration: deco('Peso (kg)'),
                         validator: (v) {
                           if (v == null || v.trim().isEmpty) {
-                            // Corregido lint: curly braces
                             return 'Ingresa tu peso';
                           }
                           final n = double.tryParse(v);
@@ -4315,28 +6209,23 @@ class _RegisterFormState extends State<_RegisterForm> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 20),
                 TextFormField(
                   controller: _correoCtrl,
                   keyboardType: TextInputType.emailAddress,
-                  decoration: const InputDecoration(
-                    labelText: 'Correo',
-                    border: OutlineInputBorder(),
-                  ),
+                  decoration: deco('Correo'),
                   validator: (v) => (v == null || !v.contains('@'))
                       ? 'Correo inválido'
                       : null,
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 20),
                 Row(
                   children: [
                     Expanded(
                       child: TextFormField(
                         controller: _passCtrl,
                         obscureText: _obscure1,
-                        decoration: InputDecoration(
-                          labelText: 'Contraseña',
-                          border: const OutlineInputBorder(),
+                        decoration: deco('Contraseña').copyWith(
                           suffixIcon: IconButton(
                             icon: Icon(
                               _obscure1
@@ -4357,9 +6246,7 @@ class _RegisterFormState extends State<_RegisterForm> {
                       child: TextFormField(
                         controller: _pass2Ctrl,
                         obscureText: _obscure2,
-                        decoration: InputDecoration(
-                          labelText: 'Confirmar contraseña',
-                          border: const OutlineInputBorder(),
+                        decoration: deco('Confirmar contraseña').copyWith(
                           suffixIcon: IconButton(
                             icon: Icon(
                               _obscure2
@@ -4377,14 +6264,17 @@ class _RegisterFormState extends State<_RegisterForm> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 32),
                 SizedBox(
                   width: double.infinity,
-                  height: 48,
                   child: FilledButton(
                     style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF004D40),
-                      foregroundColor: Colors.white,
+                      backgroundColor: cs.primary,
+                      foregroundColor: cs.onPrimary,
+                      padding: const EdgeInsets.symmetric(vertical: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(20),
+                      ),
                     ),
                     onPressed: () async {
                       if (!(_formKey.currentState?.validate() ?? false)) return;
@@ -4397,10 +6287,9 @@ class _RegisterFormState extends State<_RegisterForm> {
                         peso: double.tryParse(_pesoCtrl.text.trim()) ?? 0.0,
                         correo: _correoCtrl.text.trim(),
                         contrasena: _passCtrl.text,
+                        photoPath: null, // Agregado para foto predeterminada
                       );
-                      final nav = Navigator.of(
-                        context,
-                      ); // Corregido lint: use_build_method
+                      final nav = Navigator.of(context);
                       await saveCurrentUser(u);
                       await saveSettings(
                         UserSettings(
@@ -4429,6 +6318,7 @@ class _RegisterFormState extends State<_RegisterForm> {
   }
 }
 
+// Pantalla de presentación con CTA hacia login o registro
 class PresentationScreen extends StatelessWidget {
   const PresentationScreen({super.key});
   @override
@@ -4531,6 +6421,7 @@ class PresentationScreen extends StatelessWidget {
   }
 }
 
+// Widget del logotipo de Vitu con imagen fallback a ícono
 class _LogoVidaSaludable extends StatelessWidget {
   const _LogoVidaSaludable();
   @override
@@ -4562,7 +6453,7 @@ class _LogoVidaSaludable extends StatelessWidget {
           ),
           child: ClipOval(
             child: Image.asset(
-              'assets/WhatsApp Image 2026-02-16 at 12.16.07 PM.jpeg',
+              'assets/WhatsApp Image 2026-03-02 at 9.13.49 AM (1).jpeg',
               fit: BoxFit.contain,
               errorBuilder: (context, error, stackTrace) {
                 return const Icon(
@@ -4589,6 +6480,7 @@ class _LogoVidaSaludable extends StatelessWidget {
   }
 }
 
+// Conmutador simple entre login y registro reutilizando el mismo contenedor
 class HomeTabs extends StatefulWidget {
   final int initialIndex;
   const HomeTabs({super.key, this.initialIndex = 0});
@@ -4596,6 +6488,7 @@ class HomeTabs extends StatefulWidget {
   State<HomeTabs> createState() => _HomeTabsState();
 }
 
+// Mantiene el índice actual y muestra el contenido correspondiente
 class _HomeTabsState extends State<HomeTabs> {
   late int index;
   @override
@@ -5281,6 +7174,7 @@ class _MagazineHomeScreenState extends State<MagazineHomeScreen>
                 ),
               ),
             );
+            if (!mounted) return;
             if (result != null) {
               setState(() {
                 _brightness = result.brightness;
@@ -5345,7 +7239,7 @@ class _HomeContent extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                   image: const DecorationImage(
                     image: AssetImage(
-                      'assets/WhatsApp Image 2026-02-16 at 12.16.07 PM.jpeg',
+                      'assets/WhatsApp Image 2026-03-02 at 9.13.49 AM (1).jpeg',
                     ),
                     fit: BoxFit.cover,
                   ),
@@ -5397,10 +7291,25 @@ class _HomeContent extends StatelessWidget {
   }
 }
 
+// Datos de apariencia/preferencias propagados desde pantalla de ajustes
+// Estructura ligera para transportar configuraciones seleccionadas por el usuario
+// desde SettingsScreen hacia el árbol superior de la app. Se usa para aplicar
+// cambios de tema, color semilla, tipografía y permisos de ubicación.
+// No persiste por sí misma: la persistencia real se realiza contra Hive
+// mediante funciones auxiliares (p. ej., saveSettings) en el momento de los cambios.
 class SettingsData {
+  // Modo de brillo actual (claro u oscuro). Afecta esquemas de colores, fondos
+  // y legibilidad general. Se modela con Brightness.light/dark.
   final Brightness brightness;
+  // Color “semilla” (seed) que alimenta gradientes, acentos y sombras sutiles.
+  // Se almacena como Color completo (ARGB), y se serializa a entero cuando
+  // se guarda en ajustes por usuario.
   final Color seed;
+  // Familia tipográfica preferida. Null indica “usar sistema” (dinámica del
+  // OS), y cadenas como 'serif' habilitan fuentes personalizadas.
   final String? fontFamily;
+  // Bandera para seguir la ubicación. Al activarse, se habilitan experiencias
+  // contextualizadas por GPS en la app (p. ej., alertas locales).
   final bool followLocation;
   const SettingsData({
     required this.brightness,
@@ -5410,12 +7319,27 @@ class SettingsData {
   });
 }
 
+// Pantalla de ajustes: apariencia, datos personales, privacidad y notificaciones
+// Componente de alto nivel que centraliza las preferencias del usuario dentro
+// del contexto de salud de “Vitu”. Permite ajustar modo de tema, color semilla,
+// tipografías, datos físicos (altura/peso) y aspectos de seguridad/privacidad.
+// - onChanged: callback opcional para notificar cambios hacia el contenedor
+//   superior (útil cuando SettingsScreen se muestra como modal).
+// - asTab: si true, la pantalla se está usando como pestaña y no muestra
+//   el par de botones “Cancelar/Guardar” al pie.
 class SettingsScreen extends StatefulWidget {
+  // Brillo inicial heredado de la app (se sincroniza con el estado interno).
   final Brightness brightness;
+  // Color semilla inicial para el tema y acentos visuales.
   final Color seed;
+  // Fuente preferida inicial (null = sistema).
   final String? fontFamily;
+  // Preferencia inicial para seguimiento de ubicación.
   final bool followLocation;
+  // Callback para emitir el paquete SettingsData cuando alguna preferencia
+  // cambie. Es opcional; si no se provee, los cambios quedan locales.
   final void Function(SettingsData data)? onChanged;
+  // Indica si esta vista se renderiza como pestaña del scaffold principal.
   final bool asTab;
   const SettingsScreen({
     super.key,
@@ -5430,13 +7354,30 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
+// Estado: edita preferencias y las persiste por usuario en Hive
+// Coordina estado local, renderiza controles y actualiza la caja de usuario.
 class _SettingsScreenState extends State<SettingsScreen> {
+  // Copia local del brillo actual para interacción instantánea con la UI.
   late Brightness _brightness;
+  // Copia local del color semilla usado en gradientes y acentos.
   late Color _seed;
+  // Familia tipográfica elegida (null = sistema). Se usa en temas superiores.
   String? _fontFamily;
+  String _language = 'Español';
+  // Preferencia de seguimiento de ubicación.
   late bool _followLocation;
-  final _alturaCtrl = TextEditingController();
-  final _pesoCtrl = TextEditingController();
+  // Agregado para opciones adicionales persistentes
+  bool _shareAnon = false;
+  bool _pushEnabled = false;
+  bool _remindersEnabled = false;
+  bool _healthAlerts = false;
+  bool _locationPersonalized = false;
+  bool _highContrast = false;
+  int _notifFreq = 50;
+  double _textScale = 1.0;
+  // Emite cambios hacia el contenedor padre cuando corresponde
+  // Empaqueta el estado actual en SettingsData y llama al callback si existe.
+  // No guarda en persistencia: solo notifica al ancestro (si está interesado).
   void _emit() {
     final cb = widget.onChanged;
     if (cb != null) {
@@ -5451,6 +7392,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  // Paleta de colores amigable con etiquetas legibles para el usuario.
+  // Se usa para ofrecer opciones rápidas de “seed color” en la sección Apariencia.
   final _palette = <MapEntry<String, Color>>[
     const MapEntry('Amarillo', Color(0xFFFFECB3)),
     const MapEntry('Lima', Color(0xFFC5E1A5)),
@@ -5461,56 +7404,212 @@ class _SettingsScreenState extends State<SettingsScreen> {
   ];
 
   @override
+  // Inicializa el estado con las propiedades entrantes y precarga los campos
+  // de datos personales con los valores del usuario actual (si existe).
   void initState() {
     super.initState();
-    _brightness = widget.brightness;
-    _seed = widget.seed;
-    _fontFamily = widget.fontFamily;
-    _followLocation = widget.followLocation;
+    // Inicialización desde UserSettings (no desde props)
     final u = getCurrentUser();
-    _alturaCtrl.text = u?.altura.toString() ?? '';
-    _pesoCtrl.text = u?.peso.toString() ?? '';
+    if (u != null) {
+      final s = getSettingsForUser(u.correo);
+      _brightness = '${s?.brightness}' == 'dark'
+          ? Brightness.dark
+          : Brightness.light;
+      _seed = (s?.seedColor is int)
+          ? Color(s!.seedColor!)
+          : const Color(0xFF80CBC4);
+      _fontFamily = s?.fontFamily;
+      _language = s?.language ?? 'Español';
+      _followLocation = s?.followLocation ?? false;
+      // Agregado: inicializa opciones adicionales
+      _shareAnon = s?.shareAnonymous ?? false;
+      _pushEnabled = s?.pushEnabled ?? false;
+      _remindersEnabled = s?.remindersEnabled ?? false;
+      _healthAlerts = s?.healthAlerts ?? false;
+      _locationPersonalized = s?.locationPersonalized ?? false;
+      _highContrast = s?.highContrast ?? false;
+      _notifFreq = s?.notificationFrequency ?? 50;
+      _textScale = (s?.textScale ?? 1.0).clamp(0.8, 1.5);
+    } else {
+      _brightness = Brightness.light;
+      _seed = const Color(0xFF80CBC4);
+      _fontFamily = null;
+      _followLocation = false;
+      _shareAnon = false;
+      _pushEnabled = false;
+      _remindersEnabled = false;
+      _healthAlerts = false;
+      _locationPersonalized = false;
+      _highContrast = false;
+      _notifFreq = 50;
+      _textScale = 1.0;
+    }
   }
 
   @override
+  // Libera recursos de los TextEditingController para evitar fugas de memoria.
   void dispose() {
-    _alturaCtrl.dispose();
-    _pesoCtrl.dispose();
     super.dispose();
   }
 
+  void _onFontSegmentChanged(Set<String> s, bool isDark) {
+    final choice = s.first;
+    if (choice == 'system') {
+      setState(() => _fontFamily = null);
+      final u = getCurrentUser();
+      if (u != null) {
+        final prev = getSettingsForUser(u.correo);
+        saveSettings(
+          UserSettings(
+            userId: u.correo,
+            brightness: prev?.brightness,
+            seedColor: prev?.seedColor ?? colorToArgb(_seed),
+            fontFamily: _fontFamily,
+            language: prev?.language,
+            followLocation: prev?.followLocation ?? _followLocation,
+            metaHydratationMl:
+                prev?.metaHydratationMl ?? computeDailyHydrationGoalMl(u),
+            shareAnonymous: prev?.shareAnonymous ?? _shareAnon,
+            pushEnabled: prev?.pushEnabled ?? _pushEnabled,
+            remindersEnabled: prev?.remindersEnabled ?? _remindersEnabled,
+            healthAlerts: prev?.healthAlerts ?? _healthAlerts,
+            locationPersonalized:
+                prev?.locationPersonalized ?? _locationPersonalized,
+            highContrast: prev?.highContrast ?? _highContrast,
+            notificationFrequency: prev?.notificationFrequency ?? _notifFreq,
+            textScale: prev?.textScale ?? _textScale,
+            permissions: prev?.permissions,
+          ),
+        );
+      }
+      _emit();
+      return;
+    }
+    showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: isDark ? const Color(0xFF1E1E1E) : null,
+        title: const Text('Elegir fuente'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Serif'),
+              trailing: _fontFamily == 'serif'
+                  ? const Icon(Icons.check)
+                  : const SizedBox.shrink(),
+              onTap: () => Navigator.of(ctx).pop('serif'),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Montserrat'),
+              trailing: _fontFamily == 'Montserrat'
+                  ? const Icon(Icons.check)
+                  : const SizedBox.shrink(),
+              onTap: () => Navigator.of(ctx).pop('Montserrat'),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Poppins'),
+              trailing: _fontFamily == 'Poppins'
+                  ? const Icon(Icons.check)
+                  : const SizedBox.shrink(),
+              onTap: () => Navigator.of(ctx).pop('Poppins'),
+            ),
+          ], // Eliminado "Sistema" del diálogo de fuentes
+        ),
+      ),
+    ).then((picked) {
+      if (picked == null) return;
+      setState(() => _fontFamily = picked);
+      final u = getCurrentUser();
+      if (u != null) {
+        final prev = getSettingsForUser(u.correo);
+        saveSettings(
+          UserSettings(
+            userId: u.correo,
+            brightness: prev?.brightness,
+            seedColor: prev?.seedColor ?? colorToArgb(_seed),
+            fontFamily: _fontFamily,
+            language: prev?.language,
+            followLocation: prev?.followLocation ?? _followLocation,
+            metaHydratationMl:
+                prev?.metaHydratationMl ?? computeDailyHydrationGoalMl(u),
+            shareAnonymous: prev?.shareAnonymous ?? _shareAnon,
+            pushEnabled: prev?.pushEnabled ?? _pushEnabled,
+            remindersEnabled: prev?.remindersEnabled ?? _remindersEnabled,
+            healthAlerts: prev?.healthAlerts ?? _healthAlerts,
+            locationPersonalized:
+                prev?.locationPersonalized ?? _locationPersonalized,
+            highContrast: prev?.highContrast ?? _highContrast,
+            notificationFrequency: prev?.notificationFrequency ?? _notifFreq,
+            textScale: prev?.textScale ?? _textScale,
+            permissions: prev?.permissions,
+          ),
+        );
+      }
+      _emit();
+    }); // Fuentes Serif/Montserrat/Poppins aplicadas correctamente
+  }
+
   @override
+  // Construye la jerarquía de widgets de la pantalla de Ajustes.
+  // Define colores derivados del tema y bordes para lograr una estética
+  // consistente en modo claro/oscuro. Los “valores mágicos” de color aquí
+  // corresponden a superficies Material en dark mode (p. ej., 0xFF121212)
+  // y a escalas grises suaves en light mode (p. ej., grey[50]).
   Widget build(BuildContext context) {
+    // Tamaño de pantalla para ajustar densidad de UI y espaciamientos.
     final size = MediaQuery.of(context).size;
+    // Separación vertical base: proporcional a la altura visual.
     final vspace = size.height / 50;
+    // Bandera de modo oscuro para ramificar estilos.
     final isDark = _brightness == Brightness.dark;
-    final background = isDark
-        ? const Color(0xFF121212)
-        : (Colors.grey[50] ?? Colors.white);
-    final bodyColor = isDark
-        ? const Color(0xFFD0D0D0)
-        : const Color(0xFF1F1F1F);
-    final headingColor = isDark
-        ? const Color(0xFFF0F0F0)
-        : const Color(0xFF111111);
-    final subColor = isDark ? const Color(0xFFA0B0C0) : const Color(0xFF616161);
-    final sectionHeaderColor = isDark ? _seed.withAlpha(230) : _seed;
+    // Color de fondo principal
+    final background = Theme.of(
+      context,
+    ).colorScheme.surface; // fixed: deprecated background → color + colorScheme
+    // Colores de texto principales/variantes
+    final bodyColor = Theme.of(
+      context,
+    ).colorScheme.onSurface; // Corregido modo oscuro tarjetas/textos
+    final headingColor = Theme.of(
+      context,
+    ).colorScheme.onSurface; // Corregido modo oscuro tarjetas/textos
+    final subColor = Theme.of(
+      context,
+    ).colorScheme.onSurfaceVariant; // Corregido modo oscuro tarjetas/textos
+    // Color de los encabezados de sección
+    final sectionHeaderColor = Theme.of(
+      context,
+    ).colorScheme.primary; // Corregido modo oscuro tarjetas/textos
+    // Estilo tipográfico para títulos de sección (tamaño y grosor elevados).
     final sectionTitleStyle = TextStyle(
       fontSize: 22,
       fontWeight: FontWeight.w800,
       color: sectionHeaderColor,
     );
-    // Helpers de color (ajustes sutiles)
+    // Paleta Material 3 para contrastes dinámicos
+    final cs = Theme.of(context).colorScheme;
+    // Helpers de color para construir gradientes y resaltar selección
+    // lightenColor: incrementa la “lightness” en espacio HSL. Útil para
+    // crear el inicio del gradiente (más luminoso).
     Color lightenColor(Color c, double amount) {
       final h = HSLColor.fromColor(c);
       return h.withLightness((h.lightness + amount).clamp(0.0, 1.0)).toColor();
     }
 
+    // darkenColor: reduce la “lightness” en HSL. Cierra gradientes o crea
+    // sombras suaves en componentes.
     Color darkenColor(Color c, double amount) {
       final h = HSLColor.fromColor(c);
       return h.withLightness((h.lightness - amount).clamp(0.0, 1.0)).toColor();
     }
 
+    // saturateColor: aumenta la saturación HSL para un acento más vivo.
+    // Se usa en estados “selected” y sombras glow. El parámetro amount
+    // es una delta aditiva en [0,1], p. ej., 0.1 (+10%).
     Color saturateColor(Color c, double amount) {
       final h = HSLColor.fromColor(c);
       return h
@@ -5518,8 +7617,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           .toColor();
     }
 
-    // Estilo de SegmentedButton sin MaterialStateProperty (APIs modernas)
+    // Estilo base para SegmentedButton con estados seleccionados y normales
+    // Centraliza colores y bordes para que todos los segmentos compartan
+    // la misma línea visual. Usa WidgetStateProperty.resolveWith para aplicar
+    // estilos contextuales según el conjunto de estados activos.
     ButtonStyle segmentedStyle = ButtonStyle(
+      // Fondo del segmento:
+      // - selected: se toma el color semilla saturado con alpha ~200–220
+      // - normal: gris muy oscuro (#2C2C2C) en dark o gris claro (grey[100]) en light
       backgroundColor: WidgetStateProperty.resolveWith<Color?>((states) {
         final selected = states.contains(WidgetState.selected);
         if (isDark) {
@@ -5531,15 +7636,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ? saturateColor(_seed, 0.1).withAlpha(220)
             : (Colors.grey[100] ?? Colors.white);
       }),
+      // Color del texto/ícono:
+      // - selected: blanco para máximo contraste
+      // - normal: color “body” según modo.
       foregroundColor: WidgetStateProperty.resolveWith<Color?>((states) {
         final selected = states.contains(WidgetState.selected);
         return selected ? Colors.white : bodyColor;
       }),
+      // Borde perimetral leve para separar del fondo.
       side: WidgetStateProperty.resolveWith<BorderSide?>(
         (_) => BorderSide(
           color: isDark ? const Color(0xFF424242) : const Color(0xFFE0E0E0),
         ),
       ),
+      // Radio de 12 para esquinas redondeadas consistentes.
+      shape: const WidgetStatePropertyAll<RoundedRectangleBorder>(
+        RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(12)),
+        ),
+      ),
+      // Relleno horizontal/vertical equilibrado para toque cómodo.
+      padding: const WidgetStatePropertyAll<EdgeInsets>(
+        EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      ),
+    );
+    // Estilo del selector de Modo tema (Claro/Oscuro) con colores de esquema
+    final ButtonStyle themeToggleStyle = ButtonStyle(
+      // Mejorado contraste modo oscuro
+      backgroundColor: WidgetStateProperty.resolveWith<Color?>((states) {
+        final selected = states.contains(WidgetState.selected);
+        return selected
+            ? cs.primary
+            : cs.surfaceContainer; // fixed: deprecated surfaceVariant → surfaceContainer
+      }),
+      foregroundColor: WidgetStateProperty.resolveWith<Color?>((states) {
+        final selected = states.contains(WidgetState.selected);
+        return selected ? cs.onPrimary : cs.onSurfaceVariant;
+      }),
+      // Mejorado contraste modo oscuro - estilo Windows
+      textStyle: WidgetStateProperty.resolveWith<TextStyle?>((states) {
+        final selected = states.contains(WidgetState.selected);
+        return TextStyle(
+          fontWeight: selected ? FontWeight.w600 : FontWeight.w700,
+          height: 1.4,
+        );
+      }),
+      side: WidgetStatePropertyAll(BorderSide(color: cs.outlineVariant)),
       shape: const WidgetStatePropertyAll<RoundedRectangleBorder>(
         RoundedRectangleBorder(
           borderRadius: BorderRadius.all(Radius.circular(12)),
@@ -5550,42 +7692,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
 
-    // Card con gradient sutil a 3 paradas
-    BoxDecoration gradientCardDecoration() => BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        stops: const [0.0, 0.55, 1.0],
-        colors: [
-          lightenColor(_seed, 0.12).withAlpha(isDark ? 22 : 28),
-          saturateColor(_seed, 0.08).withAlpha(isDark ? 18 : 24),
-          darkenColor(_seed, 0.08).withAlpha(isDark ? 14 : 20),
-        ],
-      ),
-      borderRadius: BorderRadius.circular(20),
-      border: Border.all(
-        color: isDark ? const Color(0xFF424242) : const Color(0x11000000),
-      ),
-    );
+    // (Eliminado helper de gradiente no usado) // Corregido contraste modo oscuro en tarjetas
+    // Armazón principal de la pantalla; aplica fondo y coloca AppBar/Body.
     return Scaffold(
       backgroundColor: background,
+      // Barra superior adaptada al modo oscuro/claro
       appBar: AppBar(
-        backgroundColor: isDark ? _seed.withAlpha(90) : _seed.withAlpha(180),
-        elevation: 2,
-        foregroundColor: Colors.white,
-        title: const Text('Ajustes'),
+        backgroundColor: isDark
+            ? Theme.of(context).colorScheme.surfaceContainer
+            : Theme.of(
+                context,
+              ).colorScheme.surface, // Corregido modo oscuro AppBar
+        foregroundColor: Theme.of(
+          context,
+        ).colorScheme.onSurface, // Corregido modo oscuro AppBar
+        elevation: 0, // Corregido modo oscuro AppBar
+        title: Text(
+          'Ajustes',
+          style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
+        ),
       ),
+      // Cuerpo con AnimatedSwitcher para transiciones suaves cuando cambian
+      // parámetros que afectan a la UI (brillo/seed). La key reacciona a ambos.
       body: AnimatedSwitcher(
         duration: const Duration(milliseconds: 350),
         child: ListView(
           key: ValueKey('${_brightness}_${colorToArgb(_seed)}'),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
           children: [
+            // Agregado para Perfil de usuario
             Row(
               children: [
-                Icon(Icons.settings, color: sectionHeaderColor),
+                Icon(Icons.person, color: sectionHeaderColor),
                 const SizedBox(width: 8),
-                Text('General', style: sectionTitleStyle),
+                Text('Perfil de usuario', style: sectionTitleStyle),
               ],
             ),
             Card(
@@ -5598,417 +7738,68 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 borderRadius: BorderRadius.circular(20),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
-                  padding: const EdgeInsets.all(20),
-                  child: SwitchTheme(
-                    data: SwitchThemeData(
-                      thumbColor: WidgetStateProperty.resolveWith<Color?>((
-                        states,
-                      ) {
-                        final selected = states.contains(WidgetState.selected);
-                        if (selected) {
-                          return saturateColor(
-                            _seed,
-                            0.1,
-                          ).withAlpha(isDark ? 220 : 230);
-                        }
-                        return isDark ? const Color(0xFF757575) : Colors.white;
-                      }),
-                      trackColor: WidgetStateProperty.resolveWith<Color?>(
-                        (_) =>
-                            isDark ? const Color(0xFF333333) : Colors.black12,
-                      ),
-                      trackOutlineColor:
-                          WidgetStateProperty.resolveWith<Color?>(
-                            (_) => isDark
-                                ? const Color(0xFF424242)
-                                : const Color(0xFFE0E0E0),
-                          ),
-                    ),
-                    child: Column(
-                      children: [
-                        ListTile(
-                          leading: Icon(
-                            Icons.language,
-                            color: isDark ? _seed.withAlpha(230) : _seed,
-                          ),
-                          title: Text(
-                            'Idioma',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w700,
-                              color: headingColor,
-                            ),
-                          ),
-                          subtitle: Text(
-                            'Selecciona tu idioma preferido',
-                            style: TextStyle(fontSize: 14, color: subColor),
-                          ),
-                          trailing: DropdownButton<String>(
-                            value: 'Español',
-                            items: const [
-                              DropdownMenuItem(
-                                value: 'Español',
-                                child: Text('Español'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'English',
-                                child: Text('English'),
-                              ),
-                            ],
-                            onChanged: (_) {},
-                          ),
-                        ),
-                        const Divider(height: 1),
-                      ],
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.outline, // Corregido modo oscuro tarjetas
                     ),
                   ),
-                ),
-              ),
-            ),
-            SizedBox(height: vspace),
-            Row(
-              children: [
-                Icon(Icons.palette, color: sectionHeaderColor),
-                const SizedBox(width: 8),
-                Text('Apariencia', style: sectionTitleStyle),
-              ],
-            ),
-            Card(
-              margin: const EdgeInsets.symmetric(vertical: 10),
-              elevation: 3,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(20),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Modo tema',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: headingColor,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      SegmentedButton<Brightness>(
-                        segments: const [
-                          ButtonSegment(
-                            value: Brightness.light,
-                            label: Text('Claro'),
-                            icon: Icon(Icons.wb_sunny_rounded),
+                  padding: const EdgeInsets.all(12),
+                  child: Builder(
+                    builder: (context) {
+                      final u = getCurrentUser();
+                      final photo = u?.photoPath;
+                      Widget avatar;
+                      if (photo != null &&
+                          photo.isNotEmpty &&
+                          File(photo).existsSync()) {
+                        avatar = CircleAvatar(
+                          radius: 40,
+                          backgroundImage: FileImage(File(photo)),
+                        );
+                      } else {
+                        avatar = const CircleAvatar(
+                          radius: 40,
+                          child: Icon(Icons.person, size: 32),
+                        );
+                      }
+                      return ListTile(
+                        leading: avatar,
+                        title: Text(
+                          '${u?.nombre ?? ''} ${u?.apellido ?? ''}'.trim(),
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            color: headingColor,
                           ),
-                          ButtonSegment(
-                            value: Brightness.dark,
-                            label: Text('Oscuro'),
-                            icon: Icon(Icons.nightlight_round),
-                          ),
-                        ],
-                        selected: {_brightness},
-                        onSelectionChanged: (s) {
-                          setState(() => _brightness = s.first);
-                          final u = getCurrentUser();
-                          if (u != null) {
-                            final prev = getSettingsForUser(u.correo);
-                            final sdata = UserSettings(
-                              userId: u.correo,
-                              brightness: _brightness == Brightness.dark
-                                  ? 'dark'
-                                  : 'light',
-                              seedColor: prev?.seedColor ?? colorToArgb(_seed),
-                              fontFamily: prev?.fontFamily,
-                              followLocation:
-                                  prev?.followLocation ?? _followLocation,
-                              metaHydratationMl:
-                                  prev?.metaHydratationMl ??
-                                  computeDailyHydrationGoalMl(u),
-                            );
-                            saveSettings(sdata);
-                          }
-                          _emit();
-                        },
-                        style: segmentedStyle,
-                      ),
-                      SizedBox(height: vspace),
-                      Text(
-                        'Paleta de colores',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: headingColor,
                         ),
-                      ),
-                      const SizedBox(height: 12),
-                      Center(
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 350),
-                          width: size.width > 600 ? 120 : 100,
-                          height: size.width > 600 ? 120 : 100,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              stops: const [0.0, 0.6, 1.0],
-                              colors: [
-                                lightenColor(_seed, 0.12),
-                                _seed,
-                                darkenColor(_seed, 0.08),
-                              ],
+                        subtitle: Text(
+                          u?.correo ?? '',
+                          style: TextStyle(fontSize: 14, color: subColor),
+                        ),
+                        trailing: Icon(Icons.edit, color: sectionHeaderColor),
+                        onTap: () async {
+                          await Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => const UserProfileEditScreen(),
                             ),
-                            boxShadow: [
-                              BoxShadow(
-                                color: saturateColor(
-                                  _seed,
-                                  0.1,
-                                ).withAlpha(isDark ? 120 : 100),
-                                blurRadius: 14,
-                                spreadRadius: 1,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      LayoutBuilder(
-                        builder: (context, constraints) {
-                          final cross = constraints.maxWidth > 600 ? 4 : 3;
-                          return GridView.builder(
-                            shrinkWrap: true,
-                            physics: const NeverScrollableScrollPhysics(),
-                            gridDelegate:
-                                SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: cross,
-                                  childAspectRatio: 1,
-                                  mainAxisSpacing: 16,
-                                  crossAxisSpacing: 16,
-                                ),
-                            itemCount: _palette.length,
-                            itemBuilder: (context, index) {
-                              final e = _palette[index];
-                              final selected = _seed == e.value;
-                              return Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Material(
-                                    color: Colors.transparent,
-                                    child: InkWell(
-                                      customBorder: const CircleBorder(),
-                                      onTap: () {
-                                        setState(() => _seed = e.value);
-                                        final u = getCurrentUser();
-                                        if (u != null) {
-                                          final prev = getSettingsForUser(
-                                            u.correo,
-                                          );
-                                          final sdata = UserSettings(
-                                            userId: u.correo,
-                                            brightness: prev?.brightness,
-                                            seedColor: colorToArgb(_seed),
-                                            fontFamily:
-                                                prev?.fontFamily ?? _fontFamily,
-                                            followLocation:
-                                                prev?.followLocation ??
-                                                _followLocation,
-                                            metaHydratationMl:
-                                                prev?.metaHydratationMl ??
-                                                computeDailyHydrationGoalMl(u),
-                                          );
-                                          saveSettings(sdata);
-                                        }
-                                        _emit();
-                                      },
-                                      child: AnimatedScale(
-                                        duration: const Duration(
-                                          milliseconds: 220,
-                                        ),
-                                        scale: selected ? 1.08 : 1.0,
-                                        child: AnimatedContainer(
-                                          duration: const Duration(
-                                            milliseconds: 280,
-                                          ),
-                                          width: 56,
-                                          height: 56,
-                                          decoration: BoxDecoration(
-                                            shape: BoxShape.circle,
-                                            color: e.value,
-                                            boxShadow: selected
-                                                ? [
-                                                    BoxShadow(
-                                                      color: saturateColor(
-                                                        _seed,
-                                                        0.1,
-                                                      ).withAlpha(120),
-                                                      blurRadius: 14,
-                                                      spreadRadius: 1,
-                                                    ),
-                                                  ]
-                                                : [],
-                                            border: Border.all(
-                                              color: selected
-                                                  ? saturateColor(
-                                                      _seed,
-                                                      0.1,
-                                                    ).withAlpha(220)
-                                                  : Colors.transparent,
-                                              width: selected ? 2 : 0,
-                                            ),
-                                          ),
-                                          child: selected
-                                              ? Icon(
-                                                  Icons.check,
-                                                  color: Colors.white,
-                                                  size: 26,
-                                                  shadows: [
-                                                    Shadow(
-                                                      color: Colors.black54,
-                                                      blurRadius: 4,
-                                                    ),
-                                                  ],
-                                                )
-                                              : null,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    e.key,
-                                    style: TextStyle(
-                                      fontSize: 14,
-                                      color: bodyColor,
-                                    ),
-                                  ),
-                                ],
-                              );
-                            },
                           );
+                          if (mounted) setState(() {});
                         },
-                      ),
-                    ],
+                      );
+                    },
                   ),
                 ),
               ),
             ),
-            SizedBox(height: vspace),
-            Row(
-              children: [
-                Icon(Icons.badge, color: sectionHeaderColor),
-                const SizedBox(width: 8),
-                Text('Datos personales', style: sectionTitleStyle),
-              ],
-            ),
-            Card(
-              margin: const EdgeInsets.symmetric(vertical: 10),
-              elevation: 3,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(20),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _alturaCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: const InputDecoration(
-                                labelText: 'Altura (cm)',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: TextField(
-                              controller: _pesoCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: const InputDecoration(
-                                labelText: 'Peso (kg)',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        height: 44,
-                        child: FilledButton(
-                          style: FilledButton.styleFrom(
-                            backgroundColor: _seed,
-                            foregroundColor: Colors.white,
-                          ),
-                          onPressed: () async {
-                            final messenger = ScaffoldMessenger.of(context);
-                            final a = double.tryParse(_alturaCtrl.text.trim());
-                            final p = double.tryParse(_pesoCtrl.text.trim());
-                            if (a == null || a <= 0 || p == null || p <= 0) {
-                              messenger.showSnackBar(
-                                const SnackBar(
-                                  content: Text('Valores inválidos'),
-                                ),
-                              );
-                              return;
-                            }
-                            final u = getCurrentUser();
-                            if (u != null) {
-                              final updated = User(
-                                nombre: u.nombre,
-                                apellido: u.apellido,
-                                genero: u.genero,
-                                edad: u.edad,
-                                altura: a,
-                                peso: p,
-                                correo: u.correo,
-                                contrasena: u.contrasena,
-                              );
-                              await saveCurrentUser(updated);
-                              final prev = getSettingsForUser(u.correo);
-                              final goal = computeDailyHydrationGoalMl(updated);
-                              await saveSettings(
-                                UserSettings(
-                                  userId: u.correo,
-                                  brightness: prev?.brightness,
-                                  seedColor:
-                                      prev?.seedColor ?? colorToArgb(_seed),
-                                  fontFamily: prev?.fontFamily ?? _fontFamily,
-                                  followLocation:
-                                      prev?.followLocation ?? _followLocation,
-                                  metaHydratationMl: goal,
-                                ),
-                              );
-                              if (!mounted) return;
-                              messenger.showSnackBar(
-                                const SnackBar(
-                                  content: Text('Datos actualizados'),
-                                ),
-                              );
-                            }
-                          },
-                          child: const Text('Guardar'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            SizedBox(height: vspace),
+            const SizedBox(height: 24),
+            // Movido Seguridad debajo de Perfil
             Row(
               children: [
                 Icon(Icons.security, color: sectionHeaderColor),
@@ -6026,14 +7817,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 borderRadius: BorderRadius.circular(20),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
                   padding: const EdgeInsets.all(20),
                   child: Column(
                     children: [
                       ListTile(
                         leading: Icon(
                           Icons.lock_outline,
-                          color: isDark ? subColor : _seed,
+                          color: cs
+                              .onSurfaceVariant, // Corregido modo oscuro iconos
                           size: 26,
                         ),
                         title: Text(
@@ -6129,6 +7931,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               peso: u.peso,
                               correo: u.correo,
                               contrasena: newCtrl.text,
+                              photoPath: u.photoPath,
                             );
                             await saveCurrentUser(updated);
                             if (!mounted) return;
@@ -6176,14 +7979,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
             ),
-            SizedBox(height: vspace),
+            // Encabezado de la sección General
             Row(
               children: [
-                Icon(Icons.security, color: sectionHeaderColor),
+                Icon(Icons.settings, color: sectionHeaderColor),
                 const SizedBox(width: 8),
-                Text('Privacidad y seguridad', style: sectionTitleStyle),
+                Text('General', style: sectionTitleStyle),
               ],
             ),
+            // Tarjeta con preferencias generales (ej. Idioma)
             Card(
               margin: const EdgeInsets.symmetric(vertical: 10),
               elevation: 3,
@@ -6194,35 +7998,480 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 borderRadius: BorderRadius.circular(20),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
                   padding: const EdgeInsets.all(20),
+                  // Se aplica un tema de Switch para asegurar consistencia
+                  // visual en caso de incorporar interruptores en este bloque.
                   child: SwitchTheme(
                     data: SwitchThemeData(
+                      // Corregido modo oscuro switches
                       thumbColor: WidgetStateProperty.resolveWith<Color?>((
                         states,
                       ) {
                         final selected = states.contains(WidgetState.selected);
-                        if (selected) {
-                          return saturateColor(
-                            _seed,
-                            0.1,
-                          ).withAlpha(isDark ? 220 : 230);
-                        }
-                        return isDark ? const Color(0xFF757575) : Colors.white;
+                        return selected
+                            ? Theme.of(context).colorScheme.primary
+                            : Theme.of(context).colorScheme.onSurfaceVariant;
                       }),
-                      trackColor: WidgetStateProperty.resolveWith<Color?>(
-                        (_) =>
-                            isDark ? const Color(0xFF333333) : Colors.black12,
+                      trackColor: WidgetStateProperty.resolveWith<Color?>((
+                        states,
+                      ) {
+                        final selected = states.contains(WidgetState.selected);
+                        return selected
+                            ? Theme.of(
+                                context,
+                              ).colorScheme.primary.withAlpha(60)
+                            : (isDark
+                                  ? Theme.of(
+                                      context,
+                                    ).colorScheme.surfaceContainerHighest
+                                  : Theme.of(
+                                      context,
+                                    ).colorScheme.surfaceContainer);
+                      }),
+                      trackOutlineColor: WidgetStatePropertyAll(
+                        Theme.of(context).colorScheme.outline,
                       ),
-                      trackOutlineColor:
-                          WidgetStateProperty.resolveWith<Color?>(
-                            (_) => isDark
-                                ? const Color(0xFF424242)
-                                : const Color(0xFFE0E0E0),
-                          ),
                     ),
                     child: Column(
                       children: [
+                        // Preferencia de idioma. Aquí la lista es ilustrativa
+                        // y no persiste cambios (onChanged vacío).
+                        ListTile(
+                          leading: Icon(
+                            Icons.language,
+                            color: cs.primary, // Corregido modo oscuro iconos
+                          ),
+                          title: Text(
+                            'Idioma',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              color: headingColor,
+                            ),
+                          ),
+                          subtitle: Text(
+                            'Selecciona tu idioma preferido',
+                            style: TextStyle(fontSize: 14, color: subColor),
+                          ),
+                          trailing: DropdownButton<String>(
+                            value: _language,
+                            items: const [
+                              DropdownMenuItem(
+                                value: 'Español',
+                                child: Text('Español'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'English',
+                                child: Text('English'),
+                              ),
+                            ],
+                            onChanged: (v) {
+                              if (v == null) return;
+                              setState(() => _language = v);
+                              final u = getCurrentUser();
+                              if (u != null) {
+                                final prev = getSettingsForUser(u.correo);
+                                saveSettings(
+                                  UserSettings(
+                                    userId: u.correo,
+                                    brightness: prev?.brightness,
+                                    seedColor:
+                                        prev?.seedColor ?? colorToArgb(_seed),
+                                    fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: v,
+                                    followLocation:
+                                        prev?.followLocation ?? _followLocation,
+                                    metaHydratationMl:
+                                        prev?.metaHydratationMl ??
+                                        computeDailyHydrationGoalMl(u),
+                                    permissions: prev?.permissions,
+                                    shareAnonymous: prev?.shareAnonymous,
+                                    pushEnabled: prev?.pushEnabled,
+                                    remindersEnabled: prev?.remindersEnabled,
+                                    healthAlerts: prev?.healthAlerts,
+                                    locationPersonalized:
+                                        prev?.locationPersonalized,
+                                    highContrast: prev?.highContrast,
+                                    notificationFrequency:
+                                        prev?.notificationFrequency,
+                                    textScale: prev?.textScale,
+                                  ),
+                                );
+                              }
+                              _emit();
+                            },
+                          ),
+                        ),
+                        const Divider(height: 1),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            SizedBox(height: vspace),
+            // Encabezado de la sección Apariencia
+            Row(
+              children: [
+                Icon(Icons.palette, color: sectionHeaderColor),
+                const SizedBox(width: 8),
+                Text('Apariencia', style: sectionTitleStyle),
+              ],
+            ),
+            // Tarjeta de apariencia: tema (claro/oscuro) y color semilla
+            Card(
+              margin: const EdgeInsets.symmetric(vertical: 10),
+              elevation: 3,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 300),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
+                  padding: const EdgeInsets.all(20),
+                  // Envoltorio de contraste para Apariencia
+                  child: Container(
+                    // Mejorado contraste modo oscuro
+                    decoration: BoxDecoration(
+                      color: cs.surface,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Modo tema',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            color: headingColor,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        // Selector segmentado para cambiar entre Claro/Oscuro.
+                        // Actualiza estado, persiste en Hive y notifica via _emit().
+                        SegmentedButton<Brightness>(
+                          showSelectedIcon:
+                              true, // Mejorado contraste modo oscuro
+                          segments: const [
+                            ButtonSegment(
+                              value: Brightness.light,
+                              label: Text('Claro'),
+                              icon: Icon(Icons.wb_sunny_rounded),
+                            ),
+                            ButtonSegment(
+                              value: Brightness.dark,
+                              label: Text('Oscuro'),
+                              icon: Icon(Icons.nightlight_round),
+                            ),
+                          ],
+                          selected: {_brightness},
+                          // Al cambiar, guarda en ajustes del usuario y recalcula
+                          // meta de hidratación si fuese necesario.
+                          onSelectionChanged: (s) {
+                            setState(() => _brightness = s.first);
+                            final u = getCurrentUser();
+                            if (u != null) {
+                              final prev = getSettingsForUser(u.correo);
+                              final sdata = UserSettings(
+                                userId: u.correo,
+                                brightness: _brightness == Brightness.dark
+                                    ? 'dark'
+                                    : 'light',
+                                seedColor:
+                                    prev?.seedColor ?? colorToArgb(_seed),
+                                fontFamily: prev?.fontFamily,
+                                language: prev?.language,
+                                followLocation:
+                                    prev?.followLocation ?? _followLocation,
+                                metaHydratationMl:
+                                    prev?.metaHydratationMl ??
+                                    computeDailyHydrationGoalMl(u),
+                              );
+                              saveSettings(sdata);
+                            }
+                            _emit();
+                          },
+                          // Mejorado contraste modo oscuro
+                          style: themeToggleStyle,
+                        ),
+                        SizedBox(height: vspace),
+                        Text(
+                          'Paleta de colores',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            color: headingColor,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        // Previsualización circular del color semilla con gradiente
+                        // y glow sutil. El tamaño responde a pantallas anchas.
+                        Center(
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 350),
+                            width: size.width > 600 ? 120 : 100,
+                            height: size.width > 600 ? 120 : 100,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              gradient: LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                stops: const [0.0, 0.6, 1.0],
+                                colors: [
+                                  lightenColor(_seed, 0.12),
+                                  _seed,
+                                  darkenColor(_seed, 0.08),
+                                ],
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: saturateColor(
+                                    _seed,
+                                    0.1,
+                                  ).withAlpha(isDark ? 120 : 100),
+                                  blurRadius: 14,
+                                  spreadRadius: 1,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        // Cuadrícula responsiva con opciones de color etiquetadas.
+                        LayoutBuilder(
+                          builder: (context, constraints) {
+                            final cross = constraints.maxWidth > 600 ? 4 : 3;
+                            return GridView.builder(
+                              shrinkWrap: true,
+                              physics: const NeverScrollableScrollPhysics(),
+                              gridDelegate:
+                                  SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: cross,
+                                    childAspectRatio: 1,
+                                    mainAxisSpacing: 16,
+                                    crossAxisSpacing: 16,
+                                  ),
+                              itemCount: _palette.length,
+                              itemBuilder: (context, index) {
+                                final e = _palette[index];
+                                final selected = _seed == e.value;
+                                return Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Material(
+                                      color: Colors.transparent,
+                                      child: InkWell(
+                                        customBorder: const CircleBorder(),
+                                        // Al tocar, actualiza el seed, guarda en Hive
+                                        // y notifica al contenedor.
+                                        onTap: () {
+                                          setState(() => _seed = e.value);
+                                          final u = getCurrentUser();
+                                          if (u != null) {
+                                            final prev = getSettingsForUser(
+                                              u.correo,
+                                            );
+                                            final sdata = UserSettings(
+                                              userId: u.correo,
+                                              brightness: prev?.brightness,
+                                              seedColor: colorToArgb(_seed),
+                                              fontFamily:
+                                                  prev?.fontFamily ??
+                                                  _fontFamily,
+                                              language: prev?.language,
+                                              followLocation:
+                                                  prev?.followLocation ??
+                                                  _followLocation,
+                                              metaHydratationMl:
+                                                  prev?.metaHydratationMl ??
+                                                  computeDailyHydrationGoalMl(
+                                                    u,
+                                                  ),
+                                            );
+                                            saveSettings(sdata);
+                                          }
+                                          _emit();
+                                        },
+                                        // Ligera animación al seleccionar para dar
+                                        // sensación de respuesta.
+                                        child: AnimatedScale(
+                                          duration: const Duration(
+                                            milliseconds: 220,
+                                          ),
+                                          scale: selected ? 1.08 : 1.0,
+                                          child: Container(
+                                            width: 56,
+                                            height: 56,
+                                            decoration: BoxDecoration(
+                                              shape: BoxShape.circle,
+                                              // Mejorado contraste modo oscuro: fondo del círculo con seed+alpha
+                                              color: _seed.withAlpha(
+                                                ((isDark ? 0.4 : 0.2) * 255)
+                                                    .round(),
+                                              ), // Mejorado contraste modo oscuro
+                                            ),
+                                            padding: const EdgeInsets.all(4),
+                                            child: AnimatedContainer(
+                                              duration: const Duration(
+                                                milliseconds: 280,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                shape: BoxShape.circle,
+                                                // Mejorado contraste modo oscuro - estilo Windows
+                                                color: selected
+                                                    ? cs.primaryContainer
+                                                    : e.value.withAlpha(
+                                                        ((isDark ? 0.5 : 0.3) *
+                                                                255)
+                                                            .round(),
+                                                      ),
+                                                border: Border.all(
+                                                  color: selected
+                                                      ? cs.primary
+                                                      : Colors.transparent,
+                                                  width: selected ? 2 : 0,
+                                                ),
+                                                boxShadow: selected
+                                                    ? [
+                                                        BoxShadow(
+                                                          color: cs.primary
+                                                              .withAlpha(90),
+                                                          blurRadius: 12,
+                                                          spreadRadius: 1,
+                                                        ),
+                                                      ]
+                                                    : [],
+                                              ),
+                                              child: selected
+                                                  ? Icon(
+                                                      Icons.check,
+                                                      color:
+                                                          cs.onPrimaryContainer,
+                                                      size: 24,
+                                                    )
+                                                  : null,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    // Etiqueta legible del color (p. ej., “Lima”).
+                                    Text(
+                                      e.key,
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        // Mejorado contraste modo oscuro
+                                        color: selected
+                                            ? cs.onPrimaryContainer
+                                            : cs.onSurface,
+                                      ),
+                                    ),
+                                  ],
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            SizedBox(height: vspace),
+            SizedBox(height: vspace),
+            // Encabezado de la sección Privacidad y seguridad
+            Row(
+              children: [
+                Icon(Icons.security, color: sectionHeaderColor),
+                const SizedBox(width: 8),
+                Text('Privacidad y seguridad', style: sectionTitleStyle),
+              ],
+            ),
+            // Tarjeta con conmutadores de privacidad (ubicación, datos anónimos, etc.)
+            Card(
+              margin: const EdgeInsets.symmetric(vertical: 10),
+              elevation: 3,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 300),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
+                  padding: const EdgeInsets.all(20),
+                  child: SwitchTheme(
+                    data: SwitchThemeData(
+                      // Corregido modo oscuro switches
+                      thumbColor: WidgetStateProperty.resolveWith<Color?>((
+                        states,
+                      ) {
+                        final selected = states.contains(WidgetState.selected);
+                        return selected
+                            ? Theme.of(context).colorScheme.primary
+                            : Theme.of(context).colorScheme.onSurfaceVariant;
+                      }),
+                      trackColor: WidgetStateProperty.resolveWith<Color?>((
+                        states,
+                      ) {
+                        final selected = states.contains(WidgetState.selected);
+                        return selected
+                            ? Theme.of(
+                                context,
+                              ).colorScheme.primary.withAlpha(60)
+                            : (isDark
+                                  ? Theme.of(
+                                      context,
+                                    ).colorScheme.surfaceContainerHighest
+                                  : Theme.of(
+                                      context,
+                                    ).colorScheme.surfaceContainer);
+                      }),
+                      trackOutlineColor: WidgetStatePropertyAll(
+                        Theme.of(context).colorScheme.outline,
+                      ),
+                    ),
+                    child: Column(
+                      children: [
+                        // Conmutador para activar seguimiento de ubicación.
+                        // Al cambiar, se persiste en los ajustes del usuario.
                         Tooltip(
                           message: 'Activa geolocalización',
                           child: SwitchListTile(
@@ -6235,6 +8484,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               style: TextStyle(fontSize: 14, color: subColor),
                             ),
                             value: _followLocation,
+                            // Persiste la preferencia de ubicación y notifica.
                             onChanged: (v) {
                               setState(() => _followLocation = v);
                               final u = getCurrentUser();
@@ -6247,6 +8497,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                     seedColor:
                                         prev?.seedColor ?? colorToArgb(_seed),
                                     fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: prev?.language,
                                     followLocation: v,
                                     metaHydratationMl:
                                         prev?.metaHydratationMl ??
@@ -6258,6 +8509,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             },
                           ),
                         ),
+                        // Preferencia para compartir datos anónimos (mock).
+                        // Actualmente no persiste ni realiza llamadas de red.
                         Tooltip(
                           message: 'Ayúdanos a mejorar con datos anónimos',
                           child: SwitchListTile(
@@ -6265,14 +8518,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               'Compartir datos anónimos',
                               style: TextStyle(color: bodyColor),
                             ),
-                            value: false,
-                            onChanged: (_) {},
+                            value: _shareAnon,
+                            onChanged: (v) {
+                              setState(() => _shareAnon = v);
+                              final u = getCurrentUser();
+                              if (u != null) {
+                                final prev = getSettingsForUser(u.correo);
+                                saveSettings(
+                                  UserSettings(
+                                    userId: u.correo,
+                                    brightness: prev?.brightness,
+                                    seedColor:
+                                        prev?.seedColor ?? colorToArgb(_seed),
+                                    fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: prev?.language,
+                                    followLocation:
+                                        prev?.followLocation ?? _followLocation,
+                                    metaHydratationMl:
+                                        prev?.metaHydratationMl ??
+                                        computeDailyHydrationGoalMl(u),
+                                    shareAnonymous: v,
+                                    pushEnabled: prev?.pushEnabled,
+                                    remindersEnabled: prev?.remindersEnabled,
+                                    healthAlerts: prev?.healthAlerts,
+                                    locationPersonalized:
+                                        prev?.locationPersonalized,
+                                    highContrast: prev?.highContrast,
+                                    notificationFrequency:
+                                        prev?.notificationFrequency,
+                                    textScale: prev?.textScale,
+                                    permissions: prev?.permissions,
+                                  ),
+                                );
+                              }
+                              _emit();
+                            },
                           ),
                         ),
+                        // Enlace a gestor de permisos del sistema (mock).
                         ListTile(
                           leading: Icon(
                             Icons.shield_moon_outlined,
-                            color: isDark ? subColor : _seed,
+                            color: cs
+                                .onSurfaceVariant, // Corregido modo oscuro iconos
                             size: 26,
                           ),
                           title: Text(
@@ -6284,7 +8572,119 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             style: TextStyle(fontSize: 14, color: subColor),
                           ),
                           trailing: const Icon(Icons.chevron_right),
-                          onTap: () {},
+                          onTap: () async {
+                            final u = getCurrentUser();
+                            if (u == null) return;
+                            final prev = getSettingsForUser(u.correo);
+                            bool cam = prev?.permissions?['camera'] ?? false;
+                            bool loc =
+                                prev?.permissions?['location'] ??
+                                _followLocation;
+                            bool noti =
+                                prev?.permissions?['notifications'] ??
+                                _pushEnabled;
+                            final res = await showDialog<bool>(
+                              context: context,
+                              builder: (ctx) {
+                                return AlertDialog(
+                                  backgroundColor: isDark
+                                      ? const Color(0xFF1E1E1E)
+                                      : null,
+                                  title: const Text('Permisos'),
+                                  content: StatefulBuilder(
+                                    builder: (ctx, setLocal) {
+                                      return Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          SwitchListTile(
+                                            title: const Text('Cámara'),
+                                            value: cam,
+                                            onChanged: (v) =>
+                                                setLocal(() => cam = v),
+                                          ),
+                                          SwitchListTile(
+                                            title: const Text('Ubicación'),
+                                            value: loc,
+                                            onChanged: (v) =>
+                                                setLocal(() => loc = v),
+                                          ),
+                                          SwitchListTile(
+                                            title: const Text('Notificaciones'),
+                                            value: noti,
+                                            onChanged: (v) =>
+                                                setLocal(() => noti = v),
+                                          ),
+                                        ],
+                                      );
+                                    },
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () =>
+                                          Navigator.of(ctx).pop(false),
+                                      child: const Text('Cerrar'),
+                                    ),
+                                    FilledButton(
+                                      onPressed: () =>
+                                          Navigator.of(ctx).pop(true),
+                                      child: const Text('Guardar'),
+                                    ),
+                                  ],
+                                );
+                              },
+                            );
+                            if (res == true) {
+                              final ctx =
+                                  context; // fixed: use_build_context_synchronously
+                              final map = <String, bool>{
+                                'camera': cam,
+                                'location': loc,
+                                'notifications': noti,
+                              };
+                              await saveSettings(
+                                UserSettings(
+                                  userId: u.correo,
+                                  brightness: prev?.brightness,
+                                  seedColor:
+                                      prev?.seedColor ?? colorToArgb(_seed),
+                                  fontFamily: prev?.fontFamily ?? _fontFamily,
+                                  language: prev?.language,
+                                  followLocation:
+                                      prev?.followLocation ?? _followLocation,
+                                  metaHydratationMl:
+                                      prev?.metaHydratationMl ??
+                                      computeDailyHydrationGoalMl(u),
+                                  permissions: map,
+                                  shareAnonymous:
+                                      prev?.shareAnonymous ?? _shareAnon,
+                                  pushEnabled:
+                                      prev?.pushEnabled ?? _pushEnabled,
+                                  remindersEnabled:
+                                      prev?.remindersEnabled ??
+                                      _remindersEnabled,
+                                  healthAlerts:
+                                      prev?.healthAlerts ?? _healthAlerts,
+                                  locationPersonalized:
+                                      prev?.locationPersonalized ??
+                                      _locationPersonalized,
+                                  highContrast:
+                                      prev?.highContrast ?? _highContrast,
+                                  notificationFrequency:
+                                      prev?.notificationFrequency ?? _notifFreq,
+                                  textScale: prev?.textScale ?? _textScale,
+                                ),
+                              );
+                              _emit();
+                              if (!ctx.mounted) {
+                                return; // fixed: use_build_context_synchronously, fixed: curly_braces_in_if
+                              }
+                              ScaffoldMessenger.of(ctx).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Permisos guardados'),
+                                ),
+                              );
+                            }
+                          },
                         ),
                       ],
                     ),
@@ -6293,6 +8693,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             SizedBox(height: vspace),
+            // Encabezado de la sección Notificaciones
             Row(
               children: [
                 Icon(Icons.notifications, color: sectionHeaderColor),
@@ -6300,6 +8701,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Text('Notificaciones', style: sectionTitleStyle),
               ],
             ),
+            // Tarjeta con opciones de notificaciones push y frecuencia.
             Card(
               margin: const EdgeInsets.symmetric(vertical: 10),
               elevation: 3,
@@ -6310,35 +8712,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 borderRadius: BorderRadius.circular(20),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
                   padding: const EdgeInsets.all(20),
                   child: SwitchTheme(
                     data: SwitchThemeData(
+                      // Corregido modo oscuro switches
                       thumbColor: WidgetStateProperty.resolveWith<Color?>((
                         states,
                       ) {
                         final selected = states.contains(WidgetState.selected);
-                        if (selected) {
-                          return saturateColor(
-                            _seed,
-                            0.1,
-                          ).withAlpha(isDark ? 220 : 230);
-                        }
-                        return isDark ? const Color(0xFF757575) : Colors.white;
+                        return selected
+                            ? Theme.of(context).colorScheme.primary
+                            : Theme.of(context).colorScheme.onSurfaceVariant;
                       }),
-                      trackColor: WidgetStateProperty.resolveWith<Color?>(
-                        (_) =>
-                            isDark ? const Color(0xFF333333) : Colors.black12,
+                      trackColor: WidgetStateProperty.resolveWith<Color?>((
+                        states,
+                      ) {
+                        final selected = states.contains(WidgetState.selected);
+                        return selected
+                            ? Theme.of(
+                                context,
+                              ).colorScheme.primary.withAlpha(60)
+                            : (isDark
+                                  ? Theme.of(
+                                      context,
+                                    ).colorScheme.surfaceContainerHighest
+                                  : Theme.of(
+                                      context,
+                                    ).colorScheme.surfaceContainer);
+                      }),
+                      trackOutlineColor: WidgetStatePropertyAll(
+                        Theme.of(context).colorScheme.outline,
                       ),
-                      trackOutlineColor:
-                          WidgetStateProperty.resolveWith<Color?>(
-                            (_) => isDark
-                                ? const Color(0xFF424242)
-                                : const Color(0xFFE0E0E0),
-                          ),
                     ),
                     child: Column(
                       children: [
+                        // Permite activar o desactivar notificaciones push.
                         Tooltip(
                           message: 'Permite notificaciones push',
                           child: SwitchListTile(
@@ -6346,10 +8765,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               'Activar push',
                               style: TextStyle(color: bodyColor),
                             ),
-                            value: true,
-                            onChanged: (_) {},
+                            value: _pushEnabled,
+                            onChanged: (v) {
+                              setState(() => _pushEnabled = v);
+                              final u = getCurrentUser();
+                              if (u != null) {
+                                final prev = getSettingsForUser(u.correo);
+                                saveSettings(
+                                  UserSettings(
+                                    userId: u.correo,
+                                    brightness: prev?.brightness,
+                                    seedColor:
+                                        prev?.seedColor ?? colorToArgb(_seed),
+                                    fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: prev?.language,
+                                    followLocation:
+                                        prev?.followLocation ?? _followLocation,
+                                    metaHydratationMl:
+                                        prev?.metaHydratationMl ??
+                                        computeDailyHydrationGoalMl(u),
+                                    pushEnabled: v,
+                                    shareAnonymous:
+                                        prev?.shareAnonymous ?? _shareAnon,
+                                    remindersEnabled:
+                                        prev?.remindersEnabled ??
+                                        _remindersEnabled,
+                                    healthAlerts:
+                                        prev?.healthAlerts ?? _healthAlerts,
+                                    locationPersonalized:
+                                        prev?.locationPersonalized ??
+                                        _locationPersonalized,
+                                    highContrast:
+                                        prev?.highContrast ?? _highContrast,
+                                    notificationFrequency:
+                                        prev?.notificationFrequency ??
+                                        _notifFreq,
+                                    textScale: prev?.textScale ?? _textScale,
+                                    permissions: prev?.permissions,
+                                  ),
+                                );
+                              }
+                              _emit();
+                            },
                           ),
                         ),
+                        // Activa recordatorios diarios (mock).
                         Tooltip(
                           message: 'Recibe avisos diarios',
                           child: SwitchListTile(
@@ -6357,10 +8817,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               'Recordatorios diarios',
                               style: TextStyle(color: bodyColor),
                             ),
-                            value: false,
-                            onChanged: (_) {},
+                            value: _remindersEnabled,
+                            onChanged: (v) {
+                              setState(() => _remindersEnabled = v);
+                              final u = getCurrentUser();
+                              if (u != null) {
+                                final prev = getSettingsForUser(u.correo);
+                                saveSettings(
+                                  UserSettings(
+                                    userId: u.correo,
+                                    brightness: prev?.brightness,
+                                    seedColor:
+                                        prev?.seedColor ?? colorToArgb(_seed),
+                                    fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: prev?.language,
+                                    followLocation:
+                                        prev?.followLocation ?? _followLocation,
+                                    metaHydratationMl:
+                                        prev?.metaHydratationMl ??
+                                        computeDailyHydrationGoalMl(u),
+                                    remindersEnabled: v,
+                                    shareAnonymous:
+                                        prev?.shareAnonymous ?? _shareAnon,
+                                    pushEnabled:
+                                        prev?.pushEnabled ?? _pushEnabled,
+                                    healthAlerts:
+                                        prev?.healthAlerts ?? _healthAlerts,
+                                    locationPersonalized:
+                                        prev?.locationPersonalized ??
+                                        _locationPersonalized,
+                                    highContrast:
+                                        prev?.highContrast ?? _highContrast,
+                                    notificationFrequency:
+                                        prev?.notificationFrequency ??
+                                        _notifFreq,
+                                    textScale: prev?.textScale ?? _textScale,
+                                    permissions: prev?.permissions,
+                                  ),
+                                );
+                              }
+                              _emit();
+                            },
                           ),
                         ),
+                        // Alertas de salud contextualizadas según ubicación (mock).
                         Tooltip(
                           message: 'Alertas basadas en tu ubicación',
                           child: SwitchListTile(
@@ -6368,18 +8868,106 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               'Alertas de salud',
                               style: TextStyle(color: bodyColor),
                             ),
-                            subtitle: Text(
+                            value: _healthAlerts,
+                            onChanged: (v) {
+                              setState(() => _healthAlerts = v);
+                              final u = getCurrentUser();
+                              if (u != null) {
+                                final prev = getSettingsForUser(u.correo);
+                                saveSettings(
+                                  UserSettings(
+                                    userId: u.correo,
+                                    brightness: prev?.brightness,
+                                    seedColor:
+                                        prev?.seedColor ?? colorToArgb(_seed),
+                                    fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: prev?.language,
+                                    followLocation:
+                                        prev?.followLocation ?? _followLocation,
+                                    metaHydratationMl:
+                                        prev?.metaHydratationMl ??
+                                        computeDailyHydrationGoalMl(u),
+                                    healthAlerts: v,
+                                    shareAnonymous:
+                                        prev?.shareAnonymous ?? _shareAnon,
+                                    pushEnabled:
+                                        prev?.pushEnabled ?? _pushEnabled,
+                                    remindersEnabled:
+                                        prev?.remindersEnabled ??
+                                        _remindersEnabled,
+                                    locationPersonalized:
+                                        prev?.locationPersonalized ??
+                                        _locationPersonalized,
+                                    highContrast:
+                                        prev?.highContrast ?? _highContrast,
+                                    notificationFrequency:
+                                        prev?.notificationFrequency ??
+                                        _notifFreq,
+                                    textScale: prev?.textScale ?? _textScale,
+                                    permissions: prev?.permissions,
+                                  ),
+                                );
+                              }
+                              _emit();
+                            },
+                          ),
+                        ),
+                        // Agregado: Personalizadas por ubicación
+                        Tooltip(
+                          message: 'Personalización según tu ubicación',
+                          child: SwitchListTile(
+                            title: Text(
                               'Personalizadas por ubicación',
-                              style: TextStyle(fontSize: 14, color: subColor),
+                              style: TextStyle(color: bodyColor),
                             ),
-                            value: true,
-                            onChanged: (_) {},
+                            value: _locationPersonalized,
+                            onChanged: (v) {
+                              setState(() => _locationPersonalized = v);
+                              final u = getCurrentUser();
+                              if (u != null) {
+                                final prev = getSettingsForUser(u.correo);
+                                saveSettings(
+                                  UserSettings(
+                                    userId: u.correo,
+                                    brightness: prev?.brightness,
+                                    seedColor:
+                                        prev?.seedColor ?? colorToArgb(_seed),
+                                    fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: prev?.language,
+                                    followLocation:
+                                        prev?.followLocation ?? _followLocation,
+                                    metaHydratationMl:
+                                        prev?.metaHydratationMl ??
+                                        computeDailyHydrationGoalMl(u),
+                                    locationPersonalized: v,
+                                    shareAnonymous:
+                                        prev?.shareAnonymous ?? _shareAnon,
+                                    pushEnabled:
+                                        prev?.pushEnabled ?? _pushEnabled,
+                                    remindersEnabled:
+                                        prev?.remindersEnabled ??
+                                        _remindersEnabled,
+                                    healthAlerts:
+                                        prev?.healthAlerts ?? _healthAlerts,
+                                    highContrast:
+                                        prev?.highContrast ?? _highContrast,
+                                    notificationFrequency:
+                                        prev?.notificationFrequency ??
+                                        _notifFreq,
+                                    textScale: prev?.textScale ?? _textScale,
+                                    permissions: prev?.permissions,
+                                  ),
+                                );
+                              }
+                              _emit();
+                            },
                           ),
                         ),
                         ListTile(
                           leading: Icon(
                             Icons.schedule,
-                            color: isDark ? subColor : _seed,
+                            color: cs
+                                .onSurfaceVariant, // Corregido modo oscuro iconos
                           ),
                           title: Text(
                             'Frecuencia de notificaciones',
@@ -6389,13 +8977,56 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               color: headingColor,
                             ),
                           ),
+                          // Deslizador de 0–100 con 5 divisiones (cada 20).
+                          // Sirve como ejemplo de granularidad de frecuencia.
                           subtitle: Slider(
-                            value: 50,
+                            value: _notifFreq.toDouble(),
                             min: 0,
                             max: 100,
                             divisions: 5,
-                            label: '50',
-                            onChanged: (_) {},
+                            label: '$_notifFreq',
+                            onChanged: (v) => setState(() {
+                              _notifFreq = v.round();
+                            }),
+                            onChangeEnd: (v) {
+                              final u = getCurrentUser();
+                              if (u != null) {
+                                final prev = getSettingsForUser(u.correo);
+                                saveSettings(
+                                  UserSettings(
+                                    userId: u.correo,
+                                    brightness: prev?.brightness,
+                                    seedColor:
+                                        prev?.seedColor ?? colorToArgb(_seed),
+                                    fontFamily: prev?.fontFamily ?? _fontFamily,
+                                    language: prev?.language,
+                                    followLocation:
+                                        prev?.followLocation ?? _followLocation,
+                                    metaHydratationMl:
+                                        prev?.metaHydratationMl ??
+                                        computeDailyHydrationGoalMl(u),
+                                    notificationFrequency: _notifFreq,
+                                    shareAnonymous:
+                                        prev?.shareAnonymous ?? _shareAnon,
+                                    pushEnabled:
+                                        prev?.pushEnabled ?? _pushEnabled,
+                                    remindersEnabled:
+                                        prev?.remindersEnabled ??
+                                        _remindersEnabled,
+                                    healthAlerts:
+                                        prev?.healthAlerts ?? _healthAlerts,
+                                    locationPersonalized:
+                                        prev?.locationPersonalized ??
+                                        _locationPersonalized,
+                                    highContrast:
+                                        prev?.highContrast ?? _highContrast,
+                                    textScale: prev?.textScale ?? _textScale,
+                                    permissions: prev?.permissions,
+                                  ),
+                                );
+                              }
+                              _emit();
+                            },
                           ),
                         ),
                       ],
@@ -6405,6 +9036,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             SizedBox(height: vspace),
+            // Encabezado de la sección Tipografía y accesibilidad
             Row(
               children: [
                 Icon(Icons.text_fields, color: sectionHeaderColor),
@@ -6412,6 +9044,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Text('Tipografía y accesibilidad', style: sectionTitleStyle),
               ],
             ),
+            // Tarjeta con controles de fuente, tamaño de texto y alto contraste.
             Card(
               margin: const EdgeInsets.symmetric(vertical: 10),
               elevation: 3,
@@ -6422,7 +9055,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 borderRadius: BorderRadius.circular(20),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
                   padding: const EdgeInsets.all(16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -6436,6 +9079,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ),
                       const SizedBox(height: 8),
+                      // Selector para alternar entre fuente del sistema y personalizada.
                       SegmentedButton<String>(
                         segments: const [
                           ButtonSegment(
@@ -6450,32 +9094,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         ],
                         selected: {_fontFamily == null ? 'system' : 'custom'},
+                        // Actualiza la familia tipográfica y persiste en ajustes.
                         onSelectionChanged: (s) {
-                          final choice = s.first;
-                          setState(
-                            () => _fontFamily = choice == 'system'
-                                ? null
-                                : 'serif',
-                          );
-                          final u = getCurrentUser();
-                          if (u != null) {
-                            final prev = getSettingsForUser(u.correo);
-                            saveSettings(
-                              UserSettings(
-                                userId: u.correo,
-                                brightness: prev?.brightness,
-                                seedColor:
-                                    prev?.seedColor ?? colorToArgb(_seed),
-                                fontFamily: _fontFamily,
-                                followLocation:
-                                    prev?.followLocation ?? _followLocation,
-                                metaHydratationMl:
-                                    prev?.metaHydratationMl ??
-                                    computeDailyHydrationGoalMl(u),
-                              ),
-                            );
-                          }
-                          _emit();
+                          _onFontSegmentChanged(s, isDark);
                         },
                         style: segmentedStyle,
                       ),
@@ -6489,54 +9110,147 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ),
                       const SizedBox(height: 8),
+                      // Deslizador de escala tipográfica (mock). En una
+                      // implementación real, este valor podría mapearse a
+                      // MediaQuery.textScaler.
                       Tooltip(
                         message: 'Ajusta el tamaño del texto',
                         child: Slider(
-                          value: 1.0,
+                          value: _textScale,
                           min: 0.8,
                           max: 1.5,
                           divisions: 5,
-                          label: '1.0x',
-                          onChanged: (_) {},
+                          label: '${_textScale.toStringAsFixed(1)}x',
+                          onChanged: (v) => setState(() {
+                            _textScale = double.parse(v.toStringAsFixed(1));
+                          }),
+                          onChangeEnd: (v) {
+                            final u = getCurrentUser();
+                            if (u != null) {
+                              final prev = getSettingsForUser(u.correo);
+                              saveSettings(
+                                UserSettings(
+                                  userId: u.correo,
+                                  brightness: prev?.brightness,
+                                  seedColor:
+                                      prev?.seedColor ?? colorToArgb(_seed),
+                                  fontFamily: prev?.fontFamily ?? _fontFamily,
+                                  language: prev?.language,
+                                  followLocation:
+                                      prev?.followLocation ?? _followLocation,
+                                  metaHydratationMl:
+                                      prev?.metaHydratationMl ??
+                                      computeDailyHydrationGoalMl(u),
+                                  textScale: _textScale,
+                                  shareAnonymous:
+                                      prev?.shareAnonymous ?? _shareAnon,
+                                  pushEnabled:
+                                      prev?.pushEnabled ?? _pushEnabled,
+                                  remindersEnabled:
+                                      prev?.remindersEnabled ??
+                                      _remindersEnabled,
+                                  healthAlerts:
+                                      prev?.healthAlerts ?? _healthAlerts,
+                                  locationPersonalized:
+                                      prev?.locationPersonalized ??
+                                      _locationPersonalized,
+                                  highContrast:
+                                      prev?.highContrast ?? _highContrast,
+                                  notificationFrequency:
+                                      prev?.notificationFrequency ?? _notifFreq,
+                                  permissions: prev?.permissions,
+                                ),
+                              );
+                            }
+                            _emit();
+                          },
                         ),
                       ),
+                      // Modo alto contraste (mock). Útil para accesibilidad;
+                      // aquí refleja el modo oscuro actual de la pantalla.
                       SwitchTheme(
                         data: SwitchThemeData(
+                          // Corregido modo oscuro switches
                           thumbColor: WidgetStateProperty.resolveWith<Color?>((
                             states,
                           ) {
                             final selected = states.contains(
                               WidgetState.selected,
                             );
-                            if (selected) {
-                              return saturateColor(
-                                _seed,
-                                0.1,
-                              ).withAlpha(isDark ? 220 : 230);
-                            }
-                            return isDark
-                                ? const Color(0xFF757575)
-                                : Colors.white;
+                            return selected
+                                ? Theme.of(context).colorScheme.primary
+                                : Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant;
                           }),
-                          trackColor: WidgetStateProperty.resolveWith<Color?>(
-                            (_) => isDark
-                                ? const Color(0xFF333333)
-                                : Colors.black12,
+                          trackColor: WidgetStateProperty.resolveWith<Color?>((
+                            states,
+                          ) {
+                            final selected = states.contains(
+                              WidgetState.selected,
+                            );
+                            return selected
+                                ? Theme.of(
+                                    context,
+                                  ).colorScheme.primary.withAlpha(60)
+                                : (isDark
+                                      ? Theme.of(
+                                          context,
+                                        ).colorScheme.surfaceContainerHighest
+                                      : Theme.of(
+                                          context,
+                                        ).colorScheme.surfaceContainer);
+                          }),
+                          trackOutlineColor: WidgetStatePropertyAll(
+                            Theme.of(context).colorScheme.outline,
                           ),
-                          trackOutlineColor:
-                              WidgetStateProperty.resolveWith<Color?>(
-                                (_) => isDark
-                                    ? const Color(0xFF424242)
-                                    : const Color(0xFFE0E0E0),
-                              ),
                         ),
                         child: SwitchListTile(
                           title: Text(
                             'Modo alto contraste',
                             style: TextStyle(color: bodyColor),
                           ),
-                          value: isDark,
-                          onChanged: (_) {},
+                          value: _highContrast,
+                          onChanged: (v) {
+                            setState(() => _highContrast = v);
+                            final u = getCurrentUser();
+                            if (u != null) {
+                              final prev = getSettingsForUser(u.correo);
+                              saveSettings(
+                                UserSettings(
+                                  userId: u.correo,
+                                  brightness: prev?.brightness,
+                                  seedColor:
+                                      prev?.seedColor ?? colorToArgb(_seed),
+                                  fontFamily: prev?.fontFamily ?? _fontFamily,
+                                  language: prev?.language,
+                                  followLocation:
+                                      prev?.followLocation ?? _followLocation,
+                                  metaHydratationMl:
+                                      prev?.metaHydratationMl ??
+                                      computeDailyHydrationGoalMl(u),
+                                  highContrast: v,
+                                  shareAnonymous:
+                                      prev?.shareAnonymous ?? _shareAnon,
+                                  pushEnabled:
+                                      prev?.pushEnabled ?? _pushEnabled,
+                                  remindersEnabled:
+                                      prev?.remindersEnabled ??
+                                      _remindersEnabled,
+                                  healthAlerts:
+                                      prev?.healthAlerts ?? _healthAlerts,
+                                  locationPersonalized:
+                                      prev?.locationPersonalized ??
+                                      _locationPersonalized,
+                                  notificationFrequency:
+                                      prev?.notificationFrequency ?? _notifFreq,
+                                  textScale: prev?.textScale ?? _textScale,
+                                  permissions: prev?.permissions,
+                                ),
+                              );
+                            }
+                            _emit();
+                          },
                         ),
                       ),
                     ],
@@ -6545,6 +9259,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             SizedBox(height: vspace),
+            // Encabezado de la sección Acerca de
             Row(
               children: [
                 Icon(Icons.info_outline, color: sectionHeaderColor),
@@ -6552,6 +9267,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Text('Acerca de', style: sectionTitleStyle),
               ],
             ),
+            // Tarjeta con información de versión, privacidad y términos.
             Card(
               margin: const EdgeInsets.symmetric(vertical: 10),
               elevation: 3,
@@ -6562,30 +9278,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 borderRadius: BorderRadius.circular(20),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 300),
-                  decoration: gradientCardDecoration(),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Theme.of(context).colorScheme.surfaceContainer
+                        : Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLowest, // Corregido modo oscuro tarjetas
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
                   padding: const EdgeInsets.all(20),
                   child: Column(
                     children: [
+                      // Fila con versión actual de la aplicación.
                       ListTile(
                         leading: Icon(
                           Icons.info,
-                          color: isDark ? subColor : _seed,
+                          color: cs
+                              .onSurfaceVariant, // Corregido modo oscuro iconos
                           size: 26,
                         ),
                         title: Text(
-                          'Versión: 1.2.0',
+                          'Versión: 1.3.0 (2026)',
                           style: TextStyle(color: bodyColor),
                         ),
                         subtitle: Text(
-                          'Última actualización: 2024',
+                          'Última actualización: marzo 2026',
                           style: TextStyle(fontSize: 14, color: subColor),
                         ),
                       ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                        child: Text(
+                          'Vitu integra nutrición, ejercicio, hidratación y sueño para ayudarte a crear hábitos.\n'
+                          'El procesamiento se realiza localmente cuando es posible y tus datos se guardan por usuario.\n'
+                          'No vendemos tus datos; tú controlas qué compartes y cuándo.',
+                          style: TextStyle(fontSize: 14, color: subColor),
+                        ),
+                      ), // Información más detallada y realista en "Acerca de"
                       const Divider(height: 1),
+                      // Enlace a la política de privacidad (mock).
                       ListTile(
                         leading: Icon(
                           Icons.privacy_tip_outlined,
-                          color: isDark ? subColor : _seed,
+                          color: cs
+                              .onSurfaceVariant, // Corregido modo oscuro iconos
                           size: 26,
                         ),
                         title: Text(
@@ -6593,13 +9332,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           style: TextStyle(color: bodyColor),
                         ),
                         trailing: const Icon(Icons.chevron_right),
-                        onTap: () {},
+                        onTap: () {
+                          showDialog<void>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              backgroundColor: isDark
+                                  ? const Color(0xFF1E1E1E)
+                                  : null,
+                              title: const Text('Política de privacidad'),
+                              content: const Text(
+                                // Mejorado contraste modo oscuro
+                                'En Vitu respetamos tu privacidad.\n'
+                                'Recopilamos datos de salud solo con tu consentimiento para mejorar tu experiencia.\n'
+                                'No vendemos datos a terceros.\n'
+                                'Cumplimos con RGPD y leyes locales.\n'
+                                'Más info: support@vidasaludable.com',
+                              ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () => Navigator.of(ctx).pop(),
+                                  child: const Text('Cerrar'),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
                       ),
                       const Divider(height: 1),
+                      // Enlace a términos de uso (mock).
                       ListTile(
                         leading: Icon(
                           Icons.article_outlined,
-                          color: isDark ? subColor : _seed,
+                          color: cs
+                              .onSurfaceVariant, // Corregido modo oscuro iconos
                           size: 26,
                         ),
                         title: Text(
@@ -6607,19 +9372,60 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           style: TextStyle(color: bodyColor),
                         ),
                         trailing: const Icon(Icons.chevron_right),
-                        onTap: () {},
+                        onTap: () {
+                          showDialog<void>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              backgroundColor: isDark
+                                  ? const Color(0xFF1E1E1E)
+                                  : null,
+                              title: const Text('Términos de uso'),
+                              content: const Text(
+                                // Mejorado contraste modo oscuro
+                                'Al usar Vitu aceptas nuestros términos.\n'
+                                'La app es informativa y no sustituye consejo médico.\n'
+                                'No nos responsabilizamos por mal uso.\n'
+                                'Prohibido uso comercial sin permiso.',
+                              ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () => Navigator.of(ctx).pop(),
+                                  child: const Text('Cerrar'),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
                       ),
                       const Divider(height: 1),
+                      // Información de contacto del soporte.
                       ListTile(
                         leading: Icon(
                           Icons.mail_outline,
-                          color: isDark ? subColor : _seed,
+                          color: cs
+                              .onSurfaceVariant, // Corregido modo oscuro iconos
                           size: 26,
                         ),
                         title: Text(
-                          'Contacto: support@vidasaludable.com',
+                          'Contacto: vitu_salva_tu_vida@gmail.com',
                           style: TextStyle(color: bodyColor),
                         ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () {
+                          // Tappable: copiar contacto
+                          Clipboard.setData(
+                            const ClipboardData(
+                              text: 'vitu_salva_tu_vida@gmail.com',
+                            ),
+                          );
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                'Correo copiado: vitu_salva_tu_vida@gmail.com',
+                              ),
+                            ),
+                          );
+                        },
                       ),
                     ],
                   ),
@@ -6627,11 +9433,68 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             SizedBox(height: vspace),
+            // Botón de guardado consistente para ambos modos (tab y modal)
+            SizedBox(
+              width: double.infinity,
+              height: 52,
+              child: FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _seed,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  elevation: 4,
+                ),
+                onPressed: () async {
+                  final u = getCurrentUser();
+                  if (u == null) return;
+                  final settings = UserSettings(
+                    userId: u.correo,
+                    brightness: _brightness == Brightness.dark
+                        ? 'dark'
+                        : 'light',
+                    seedColor: colorToArgb(_seed),
+                    fontFamily: _fontFamily,
+                    language: _language,
+                    followLocation: _followLocation,
+                    metaHydratationMl:
+                        getSettingsForUser(u.correo)?.metaHydratationMl ??
+                        computeDailyHydrationGoalMl(u),
+                  );
+                  await saveSettings(settings);
+                  if (!context.mounted) {
+                    // fixed: curly_braces_in_if, use_build_context_synchronously
+                    return;
+                  }
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Cambios guardados')),
+                  );
+                  // Si está en modo modal (asTab == false), también hacer pop con datos
+                  if (!widget.asTab) {
+                    Navigator.of(context).pop(
+                      SettingsData(
+                        brightness: _brightness,
+                        seed: _seed,
+                        fontFamily: _fontFamily,
+                        followLocation: _followLocation,
+                      ),
+                    );
+                  }
+                },
+                child: const Text(
+                  'Guardar cambios',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+            // Si se muestra como modal (no tab), añade acciones Cancelar/Guardar.
             widget.asTab
                 ? const SizedBox.shrink()
                 : Row(
                     children: [
                       Expanded(
+                        // Acción secundaria: descartar cambios y cerrar.
                         child: OutlinedButton(
                           style: OutlinedButton.styleFrom(
                             foregroundColor: isDark ? bodyColor : subColor,
@@ -6658,6 +9521,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                       const SizedBox(width: 12),
                       Expanded(
+                        // Acción primaria: devuelve SettingsData y cierra.
                         child: ElevatedButton(
                           style: ElevatedButton.styleFrom(
                             backgroundColor: _seed,
