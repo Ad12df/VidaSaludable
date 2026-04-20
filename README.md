@@ -69,14 +69,14 @@ Referencias en [pubspec.yaml](file:///c:/Users/javie/OneDrive/Documentos/GitHub/
 |---|---:|---|
 | hive | ^2.2.3 | Persistencia local NoSQL (cajas por dominio) |
 | hive_flutter | ^1.1.0 | Inicialización de Hive en Flutter |
-| path_provider | ^2.1.2 | Rutas de documentos para guardar fotos |
-| image_picker | ^1.0.7 | Captura/selección de imagen de comida |
+| path_provider | ^2.1.4 | Rutas de documentos para guardar fotos |
+| image_picker | ^1.1.2 | Captura/selección de imagen de comida |
 | google_generative_ai | ^0.4.0 | Integración con Gemini (texto e imagen) |
 | geolocator | ^12.0.0 | GPS, permisos y cálculo de distancias |
 | fl_chart | ^0.68.0 | Gráficas de progreso y series |
 | intl | ^0.19.0 | Formateo de fechas y textos |
 | url_launcher | ^6.2.5 | Apertura de enlaces externos (p. ej. recursos) |
-| shared_preferences | ^2.2.2 | Dependencia declarada; uso limitado/no crítico en main.dart |
+| shared_preferences | ^2.2.3 | Dependencia declarada; uso limitado/no crítico en main.dart |
 
 ### 4.3 Dependencias de Desarrollo
 
@@ -562,6 +562,1067 @@ Si `apiKey` es vacío, mostrar un mensaje y deshabilitar módulos de IA.
 ### 10.3 Modelos y Límites
 
 Modelo configurado en el código:
+
+- `gemini-2.5-flash` (texto + multimodal).
+
+Observación:
+Existe un `debugPrint("Intentando ping con modelo: gemini-pro-vision");` aunque el modelo usado es `gemini-2.5-flash`. Esta inconsistencia es solo log, pero conviene alinearla.
+
+## 11. Permisos y Configuración de Plataforma
+
+### 11.1 Android
+
+Archivo: [AndroidManifest.xml](file:///c:/Users/javie/OneDrive/Documentos/GitHub/VidaSaludable/android/app/src/main/AndroidManifest.xml)
+
+Permisos relevantes:
+
+- `ACCESS_FINE_LOCATION`
+- `ACCESS_COARSE_LOCATION`
+
+Uso:
+Módulo de ejercicio y cualquier lógica contextual que dependa de GPS.
+
+### 11.2 iOS
+
+Archivo: [Info.plist](file:///c:/Users/javie/OneDrive/Documentos/GitHub/VidaSaludable/ios/Runner/Info.plist)
+
+Claves observadas:
+
+- `NSLocationWhenInUseUsageDescription`
+- `NSLocationAlwaysAndWhenInUseUsageDescription`
+
+Permisos adicionales recomendados para `image_picker` (si se habilita cámara/galería en iOS):
+
+- `NSCameraUsageDescription`
+- `NSPhotoLibraryUsageDescription`
+- `NSPhotoLibraryAddUsageDescription`
+
+## 12. Sistema de Temas y Accesibilidad
+
+### 12.1 Objetivo de Diseño
+
+El sistema de tema busca:
+
+- Soportar modo oscuro/claro.
+- Mantener consistencia visual por usuario.
+- Permitir personalización de color semilla (Material 3).
+- Permitir tipografía preferida.
+- Exponer accesibilidad global con escala de texto y alto contraste.
+
+### 12.2 Componentes Técnicos
+
+- `ThemeData` con `useMaterial3: true`.
+- `ColorScheme.fromSeed(seedColor: ...)` para generar paletas.
+- Propagación por `Theme` y `MediaQuery.copyWith(...)` para accesibilidad.
+
+Fragmento real: aplicación de escala de texto y alto contraste a nivel global:
+
+```dart
+return MediaQuery(
+  data: mq.copyWith(
+    textScaler: TextScaler.linear(_textScale),
+    highContrast: _highContrast,
+  ),
+  child: Theme(
+    data: theme,
+    child: Scaffold(
+      body: IndexedStack(index: _index, children: pages),
+    ),
+  ),
+);
+```
+
+### 12.3 Tipografías (fontFamily)
+
+Opciones expuestas en SettingsScreen:
+
+- `null` (sistema)
+- `"serif"`
+- `"Montserrat"`
+- `"Poppins"`
+
+Nota:
+Si una familia no está incluida como asset de fuente en Flutter, el motor hará fallback a la fuente disponible. Para garantizar exactitud se recomienda declarar fuentes en `pubspec.yaml`.
+
+### 12.4 Color Semilla (Seed)
+
+SettingsScreen define una paleta de presets:
+
+- Amarillo `0xFFFFECB3`
+- Lima `0xFFC5E1A5`
+- Verde `0xFFA5D6A7`
+- Azul `0xFF90CAF9`
+- Rojo `0xFFEF9A9A`
+- Morado `0xFFCE93D8`
+
+Además, la UI usa helpers HSL para lighten/darken/saturate y estilos con `WidgetStateProperty.resolveWith`.
+
+## 13. Navegación y Pantallas (Referencia Completa)
+
+### 13.1 Splash / Entrada
+
+Responsabilidad:
+
+- Mostrar animación inicial.
+- Determinar si existe sesión (`currentUserEmail`).
+- Redirigir a:
+  - `HomeTabs` si hay usuario autenticado.
+  - `LoginRegisterScreen` si no hay sesión.
+
+Aspectos técnicos:
+
+- Uso de `AnimationController`.
+- Navegación con `pushReplacement` o `pushAndRemoveUntil` para reset de stack.
+
+### 13.2 LoginRegisterScreen (Autenticación Local)
+
+Responsabilidad:
+
+- Registro de usuario (persistencia en Hive `users`).
+- Inicio de sesión (validación local).
+- Escritura de `currentUserEmail`.
+
+Flujo:
+
+1. Usuario ingresa correo y contraseña.
+2. Si modo registro:
+   - Solicita datos adicionales.
+   - Crea `User`.
+   - Guarda en `users` con clave `user:<correo>`.
+3. Si modo login:
+   - Lee `user:<correo>`.
+   - Verifica contraseña.
+4. En éxito:
+   - Guarda `currentUserEmail`.
+   - Navega a HomeTabs.
+
+Consideración:
+No existe hashing ni “forgot password”. La recuperación no está implementada.
+
+### 13.3 HomeTabs (Navegación Principal)
+
+Responsabilidad:
+
+- Mantener índice de pestaña.
+- Renderizar páginas con `IndexedStack` para conservar estado interno.
+- Aplicar Theme y MediaQuery globales de accesibilidad.
+
+Pestañas observadas:
+
+- Nutrición (HomeScreen)
+- Ejercicio (ExerciseScreen)
+- Hidratación (HydrationScreen)
+- Sueño (SleepScreen)
+- Ajustes (SettingsScreen)
+
+Además se accede a pantallas secundarias como:
+
+- PresentationScreen
+- MagazineHomeScreen
+- RoutineSuggestionScreen
+- UserProfileEditScreen
+
+### 13.4 HomeScreen (Nutrición con IA)
+
+Responsabilidad:
+
+- Captura/selección de foto de comida.
+- Guardado local de la imagen en Documents Directory.
+- Envío de imagen + prompt a Gemini.
+- Parseo de respuesta en formato fijo para extraer:
+  - Plato
+  - Calorías
+  - Proteínas
+  - Carbohidratos
+  - Grasas
+- Mostrar recomendación y recetas.
+
+#### 13.4.1 Flujo de Captura y Guardado
+
+1. El usuario elige fuente (cámara o galería).
+2. `image_picker` devuelve `XFile`.
+3. Se copia a Documents Directory con nombre `vitu_food_<ts>.jpg`.
+4. Se guarda en `_savedPhotos` para historial inmediato.
+
+Fragmento real:
+
+```dart
+final dir = await getApplicationDocumentsDirectory();
+final ts = DateTime.now().millisecondsSinceEpoch;
+final path = '${dir.path}/vitu_food_$ts.jpg';
+final file = File(path);
+await file.writeAsBytes(await xfile.readAsBytes());
+setState(() {
+  _photo = file;
+  _savedPhotos.insert(0, file);
+});
+```
+
+#### 13.4.2 `_analizarConGemini(File foto)`
+
+Objetivo:
+Enviar imagen y prompt a Gemini y extraer macronutrientes.
+
+Precondiciones:
+
+- El archivo existe.
+- El tamaño del archivo es > 0.
+
+Salida:
+
+- Actualiza `_plato`, `_kcal`, `_prot`, `_carb`, `_fat`.
+
+Fragmento real (extracto representativo):
+
+```dart
+final bytes = await foto.readAsBytes();
+final lower = foto.path.toLowerCase();
+final mime = lower.endsWith('.png') ? 'image/png' : 'image/jpeg';
+final content = Content.multi([TextPart(prompt), DataPart(mime, bytes)]);
+final resp = await _geminiModel
+    .generateContent([content])
+    .timeout(const Duration(seconds: 20));
+final text = resp.text ?? '';
+```
+
+Contrato de formato:
+El prompt exige un formato exacto de respuesta, lo que permite parseo determinístico. Ejemplo esperado:
+
+```text
+Plato: Pollo a la plancha con ensalada
+Calorías: 540 kcal
+Proteínas: 45 g
+Carbohidratos: 35 g
+Grasas: 22 g
+```
+
+#### 13.4.3 `_cargarRecetasRecomendadas()`
+
+Objetivo:
+Construir recomendaciones de recetas (posiblemente en base a preferencias del usuario) y poblar `_recetasRecomendadas`.
+
+Notas:
+La pantalla invoca esta carga al iniciar (`Future.microtask(_cargarRecetasRecomendadas);`). La estrategia exacta puede combinar:
+
+- Listas estáticas.
+- Llamadas a Gemini para recetas (según implementación).
+
+### 13.5 ExerciseScreen (Ejercicio con GPS)
+
+Responsabilidad:
+
+- Solicitar permisos de ubicación.
+- Iniciar tracking con Geolocator.
+- Calcular distancia incremental entre posiciones sucesivas.
+- Convertir distancia a pasos con longitud de zancada fija.
+- Persistir resultado diario en Hive `daily_exercise`.
+
+#### 13.5.1 Conversión Distancia a Pasos
+
+Supuesto:
+Longitud de paso constante:
+
+- `_stepLengthMeters = 0.75`
+
+Fragmentos reales:
+
+```dart
+int distanceToSteps(double meters) {
+  if (meters <= 0) return 0;
+  return (meters / _stepLengthMeters).floor();
+}
+
+double calculateDistance(Position a, Position b) {
+  return Geolocator.distanceBetween(
+    a.latitude,
+    a.longitude,
+    b.latitude,
+    b.longitude,
+  );
+}
+```
+
+Implicación:
+El conteo de pasos es una estimación. Para precisión real se requeriría integración con sensores (pedometer/health APIs).
+
+#### 13.5.2 Tracking de Ubicación: `startLocationTracking()`
+
+Objetivo:
+Iniciar un stream de posiciones y acumular distancia.
+
+Puntos técnicos:
+
+- Manejo de permisos con Geolocator.
+- Control de estado `mounted`.
+- Gestión de suscripciones para evitar fugas.
+
+Persistencia:
+
+- Se guarda en `daily_exercise` con clave `<correo>_<date>`.
+- Se opcionaliza el guardado de logs `exercise_logs:<correo>`.
+
+### 13.6 HydrationScreen (Hidratación y Recordatorios)
+
+Responsabilidad:
+
+- Calcular meta diaria (ml) a partir del usuario y/o settings persistidos.
+- Permitir al usuario registrar consumo incremental.
+- Persistir eventos y resumen diario.
+- Mostrar progreso circular y gráficos semanales.
+- Programar recordatorios periódicos (mock).
+
+#### 13.6.1 Meta Diaria
+
+Reglas:
+
+- Preferencia `metaHydratationMl` en settings tiene prioridad.
+- Si no existe, se calcula mediante `computeDailyHydrationGoalMl(u)`.
+
+#### 13.6.2 Registro de Hidratación: `addHydrationMl(...)`
+
+Propósito:
+
+- Agregar un evento (ts, ml) al log diario.
+- Recalcular total y guardar resumen diario.
+
+Fragmento real:
+
+```dart
+Future<void> addHydrationMl({
+  required String userId,
+  required int ml,
+  DateTime? when,
+  required int goalMl,
+}) async {
+  final date = (when ?? DateTime.now());
+  final key = '${userId}_${_toYmd(date)}';
+  final logs = (_hydrationLogsBox.get(key) as List?)?.cast<Map>() ?? <Map>[];
+  logs.add({'ts': date.millisecondsSinceEpoch, 'ml': ml});
+  await _hydrationLogsBox.put(key, logs);
+  final total = logs.fold<int>(0, (acc, e) => acc + (e['ml'] as int? ?? 0));
+  await _dailyHydrationSummaryBox.put(key, {
+    'date': _toYmd(date),
+    'totalMl': total,
+    'goalMl': goalMl,
+    'updatedAt': DateTime.now().millisecondsSinceEpoch,
+  });
+}
+```
+
+#### 13.6.3 Recordatorios: `_syncReminderTimer()`
+
+Implementación actual:
+
+- Usa `Timer.periodic` con intervalo en horas.
+- Solo “activa” recordatorios bajo ciertas condiciones internas (`_inBackground`, `_reminderHours > 0`).
+- En lugar de notificación nativa, reproduce un sonido:
+
+```dart
+_reminderTimer = Timer.periodic(Duration(hours: _reminderHours), (_) {
+  if (!mounted) return;
+  SystemSound.play(SystemSoundType.alert);
+});
+```
+
+Limitación crítica:
+Los timers no garantizan ejecución en background prolongado (depende del sistema). Para producción se requiere notificaciones locales programadas y/o background services según plataforma.
+
+### 13.7 SleepScreen (Sueño: Manual + Inactividad)
+
+Responsabilidad:
+
+- Registrar sueño manual (horas).
+- Detectar inactividad del usuario dentro de una ventana horaria (ej. noche).
+- Acumular segmentos de inactividad como aproximación de sueño.
+- Persistir resumen diario en `daily_sleep`.
+
+#### 13.7.1 Detección de Inactividad: `_startInactivityTracking()`
+
+Comportamiento real:
+
+- Timer de 1 minuto.
+- Si está dentro de ventana horaria (`_inWindow(now)`), evalúa diferencia entre `now` y `_lastInteractionTs`.
+- Si supera 30 minutos, fija `_inactiveStart` y considera ese intervalo como potencial sueño.
+
+Fragmento real:
+
+```dart
+_inactivityTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+  final now = DateTime.now();
+  if (!_inWindow(now)) {
+    _inactiveStart = null;
+    return;
+  }
+  _lastInteractionTs ??= now;
+  final diff = now.difference(_lastInteractionTs!);
+  if (diff.inMinutes >= 30) {
+    _inactiveStart ??= _lastInteractionTs;
+  }
+});
+```
+
+#### 13.7.2 Corte Diario (8:00 AM)
+
+Existe una lógica de corte diario para cerrar el “día de sueño” y evitar arrastrar inactividad. Este comportamiento permite que el sueño nocturno se asigne correctamente a la fecha, independientemente de la hora de finalización.
+
+#### 13.7.3 Persistencia de Sueño
+
+- Clave: `<correo>_<YYYY-MM-DD>` en `daily_sleep`.
+- Resumen con horas y metadata.
+- Persistencia secundaria: `sleep_<correo>_<YYYY-MM-DD>` como `double`.
+
+Punto de mejora:
+Unificar en una sola representación y eliminar duplicidad.
+
+### 13.8 SettingsScreen (Ajustes, Perfil, Seguridad y Accesibilidad)
+
+Responsabilidad:
+
+- Edición de apariencia: tema, color semilla, tipografía.
+- Preferencias generales: idioma.
+- Seguridad: cambio de contraseña y cierre de sesión.
+- Privacidad y notificaciones: toggles (shareAnonymous, pushEnabled, etc.).
+- Accesibilidad: alto contraste, escala de texto.
+- Persistencia inmediata: cada cambio se guarda en `user_settings`.
+
+#### 13.8.1 Cambio de Fuente: `_onFontSegmentChanged(...)`
+
+Comportamiento:
+
+- Si se selecciona `system`, se define `_fontFamily = null`.
+- Para serif/Montserrat/Poppins, se abre un diálogo y se persiste selección.
+
+Fragmento real (extracto de persistencia):
+
+```dart
+saveSettings(
+  UserSettings(
+    userId: u.correo,
+    seedColor: prev?.seedColor ?? colorToArgb(_seed),
+    fontFamily: _fontFamily,
+    metaHydratationMl: prev?.metaHydratationMl ?? computeDailyHydrationGoalMl(u),
+    notificationFrequency: prev?.notificationFrequency ?? _notifFreq,
+    textScale: prev?.textScale ?? _textScale,
+  ),
+);
+```
+
+#### 13.8.2 Cierre de Sesión
+
+Implementación:
+
+- Elimina `currentUserEmail` de `users`.
+- Redirige a `LoginRegisterScreen` y limpia stack:
+
+```dart
+await _usersBox.delete('currentUserEmail');
+nav.pushAndRemoveUntil(
+  MaterialPageRoute(builder: (_) => const LoginRegisterScreen()),
+  (route) => false,
+);
+```
+
+### 13.9 UserProfileEditScreen (Edición de Perfil)
+
+Responsabilidad:
+
+- Editar datos del usuario: nombre, apellido, género, edad, altura, peso.
+- Gestionar foto de perfil (según implementación).
+- Persistir cambios en `users` bajo `user:<correo>`.
+
+Relación:
+Sus cambios afectan:
+
+- Cálculo de meta de hidratación.
+- Personalización de prompts de IA.
+
+### 13.10 RoutineSuggestionScreen (Rutinas con IA)
+
+Responsabilidad:
+
+- Generar sugerencias de rutina (fuerza/yoga/estiramiento, etc.).
+- Consultar Gemini con prompt personalizado.
+- Mostrar resultados en UI.
+
+Consideración:
+Similar a HomeScreen, usa API key de Gemini. Se recomienda unificar inyección de clave y un solo “GeminiClient”.
+
+### 13.11 PresentationScreen
+
+Responsabilidad:
+
+- Pantalla de presentación/introducción con navegación hacia módulos.
+- Proporciona contexto y onboarding visual.
+
+### 13.12 MagazineHomeScreen (Contenido/Artículos)
+
+Responsabilidad:
+
+- Mostrar contenido tipo magazine: artículos, tips, recursos.
+- Acciones de navegación hacia vistas secundarias y enlaces.
+
+## 14. Módulos Funcionales en Profundidad
+
+### 14.1 Módulo de Nutrición con IA (Gemini)
+
+#### 14.1.1 Objetivo
+
+Transformar una fotografía de comida en un resumen nutricional aproximado y en recomendaciones accionables.
+
+#### 14.1.2 Pipeline Técnico
+
+1. Adquisición de imagen (cámara/galería).
+2. Normalización (guardado local y detección MIME).
+3. Construcción de prompt:
+   - Formato estrictamente parseable.
+   - Posible personalización con datos del usuario (edad/peso/objetivo).
+4. Envío multimodal:
+   - `Content.multi([TextPart(prompt), DataPart(mime, bytes)])`
+5. Recepción y parseo:
+   - Extracción por líneas y patrones `Campo: valor`.
+6. Renderizado:
+   - Card con plato/macros.
+   - Gráfico o tabla (si aplica).
+
+#### 14.1.3 Control de Errores
+
+Casos tratados:
+
+- Imagen vacía: se aborta análisis y se ofrece retry.
+- Timeout: `.timeout(Duration(seconds: 20))`
+- Excepciones `GenerativeAIException`: se informa al usuario.
+- Falta de conectividad: `SocketException`.
+
+#### 14.1.4 Limitaciones
+
+- Estimaciones aproximadas: la IA no puede garantizar valores exactos sin contexto.
+- Sesgo por porción y ángulo de foto.
+- Dependencia de conectividad y cuota.
+
+### 14.2 Módulo de Ejercicio (GPS + Estimación de Pasos)
+
+#### 14.2.1 Objetivo
+
+Estimular actividad física registrando caminatas/carreras mediante GPS y traduciendo distancia a pasos estimados.
+
+#### 14.2.2 Pipeline Técnico
+
+1. Solicitud de permisos de ubicación.
+2. Suscripción a stream de posiciones.
+3. Cálculo de distancia incremental:
+   - `Geolocator.distanceBetween`.
+4. Acumulación:
+   - Distancia total en metros.
+   - Pasos = `floor(meters / 0.75)`.
+5. Persistencia por día.
+6. Visualización:
+   - Gráficas semanales (fl_chart).
+   - Resumen actual.
+
+#### 14.2.3 Consideraciones de Precisión
+
+- GPS tiene ruido; se recomienda filtrar por precisión y velocidad.
+- La zancada fija varía por altura, velocidad y género; idealmente se calcula por usuario o se calibra.
+
+### 14.3 Módulo de Hidratación (Metas + Eventos + Recordatorios)
+
+#### 14.3.1 Objetivo
+
+Ayudar a mantener una ingesta hídrica diaria adecuada.
+
+#### 14.3.2 Modelo de Datos
+
+- Eventos: lista de `{ts, ml}` por día.
+- Resumen: `{totalMl, goalMl}` por día.
+
+#### 14.3.3 UX del Registro
+
+- Botones y slider para añadir agua en incrementos.
+- Indicador circular de progreso.
+- Acceso a historial diario.
+
+#### 14.3.4 Recordatorios (Estado Actual vs Recomendado)
+
+Estado actual:
+
+- Timer + sonido.
+- No persistente ante cierres de app.
+
+Recomendado:
+
+- Notificaciones locales con programación.
+- Persistencia de schedule por usuario.
+- Control “quiet hours” y frecuencia por ventana.
+
+### 14.4 Módulo de Sueño (Manual + Detección por Inactividad)
+
+#### 14.4.1 Objetivo
+
+Registrar duración de sueño de manera simple con soporte de automatización aproximada.
+
+#### 14.4.2 Detección por Inactividad
+
+Heurística implementada:
+
+- Si el usuario no interactúa por >= 30 min en ventana nocturna, se considera un segmento de inactividad.
+
+Importante:
+Esta heurística mide inactividad de la app, no inactividad física del dispositivo, por lo que:
+
+- Puede subestimar si el usuario no abre la app.
+- Puede sobreestimar si deja la app abierta.
+
+#### 14.4.3 Corte Diario
+
+El corte a las 8:00 AM evita que el día “se alargue” y permite cierre de segmentos.
+
+## 15. Referencia Técnica de Funciones Principales (main.dart)
+
+Esta sección lista funciones relevantes y su papel en el sistema. Los nombres se toman del código real y reflejan comportamiento en runtime.
+
+### 15.1 IA / Gemini
+
+- `_analizarConGemini(File foto)`:
+  - Entrada: archivo de imagen.
+  - Salida: macros y nombre del plato.
+  - Efectos: actualiza estado UI, muestra snackbars, hace llamadas a red.
+- `_cargarRecetasRecomendadas()`:
+  - Entrada: estado actual + usuario (implícito).
+  - Salida: lista de `_Receta` para UI.
+- `_fetchSuggestions()` (en rutinas o recomendaciones):
+  - Entrada: prompt parametrizado.
+  - Salida: texto/estructura con recomendaciones.
+
+### 15.2 Hidratación
+
+- `addHydrationMl({required String userId, required int ml, DateTime? when, required int goalMl})`:
+  - Persistencia: `hydration_logs` y `daily_hydration_summary`.
+  - Idempotencia: no; cada llamada agrega un evento.
+- `_syncReminderTimer()`:
+  - Orquesta timers según configuración y estado de la app.
+- `_loadToday()`:
+  - Lee logs/resumen del día y reconstruye el estado.
+
+### 15.3 Ejercicio
+
+- `startLocationTracking()`:
+  - Solicita permisos y suscribe al stream.
+  - Acumula distancia y pasos.
+- `calculateDistance(Position a, Position b)`:
+  - Distancia geodésica.
+- `distanceToSteps(double meters)`:
+  - Conversión estimada.
+
+### 15.4 Sueño
+
+- `_startInactivityTracking()`:
+  - Inicia timer de análisis de inactividad.
+- `_inWindow(DateTime now)`:
+  - Determina si se evalúa inactividad.
+- `_accumulateSleep(...)` (acumulación diaria):
+  - Convierte segmentos a horas.
+- `_scheduleDailyCutoff()`:
+  - Programa corte 8:00 AM.
+
+### 15.5 Usuario / Sesión
+
+- `getCurrentUser()`:
+  - Lee `currentUserEmail` y luego `user:<correo>`.
+- `saveCurrentUser(User u)`:
+  - Persiste perfil.
+- `getSettingsForUser(String userId)`:
+  - Lee `settings:<correo>`.
+- `saveSettings(UserSettings s)`:
+  - Persiste preferencia.
+
+## 16. Seguridad, Privacidad y Cumplimiento
+
+### 16.1 Almacenamiento Local
+
+Datos sensibles guardados en el dispositivo:
+
+- Credenciales (contraseña en claro).
+- Foto de perfil (ruta local).
+- Registros de salud (hidratación, sueño, ejercicio).
+
+Recomendaciones:
+
+1. Hash de contraseña y no guardar en claro.
+2. Cifrado de Hive (Hive AES) para datos sensibles.
+3. Opción de “borrar datos” por usuario.
+
+### 16.2 Uso de Ubicación
+
+Uso:
+
+- Ejercicio (distancia y rutas).
+
+Buenas prácticas:
+
+- Solicitar solo “When In Use”.
+- Explicar finalidad en UI.
+- Permitir desactivación total (ya existe `followLocation`).
+
+### 16.3 IA y Datos
+
+El análisis de imágenes implica enviar contenido a un servicio externo (Gemini).
+
+Recomendaciones:
+
+- Aviso de privacidad explícito.
+- Consentimiento del usuario.
+- Posibilidad de desactivar IA.
+
+## 17. Configuración Avanzada de Release
+
+### 17.1 Android Keystore (Referencia)
+
+Pasos típicos:
+
+1. Crear keystore:
+
+```bash
+keytool -genkey -v -keystore keystore.jks -keyalg RSA -keysize 2048 -validity 10000 -alias vitu
+```
+
+2. Configurar `key.properties` (no versionar).
+3. Configurar `android/app/build.gradle` con signingConfigs.
+
+Nota:
+No incluir claves en repositorio.
+
+### 17.2 Variables de Entorno y `--dart-define`
+
+Para evitar secretos:
+
+- `GEMINI_API_KEY`
+- Flags de entorno (p. ej. `VITU_ENV=prod`)
+
+Ejemplo:
+
+```bash
+flutter build apk --release --dart-define=GEMINI_API_KEY=<TU_API_KEY>
+```
+
+## 18. Troubleshooting (Problemas Comunes)
+
+### 18.1 “Gemini ping failed”
+
+Causas probables:
+
+- API key inválida o revocada.
+- Sin internet.
+- Cuota agotada.
+- Modelo no disponible para la región.
+
+Acciones:
+
+- Verificar clave en `https://aistudio.google.com/app/apikey`.
+- Revisar conectividad del dispositivo.
+- Probar con un prompt corto y revisar logs.
+
+### 18.2 “Location permission denied”
+
+Acciones:
+
+- Conceder permisos en Ajustes del sistema.
+- Verificar manifest/plist.
+- Verificar configuración de Geolocator.
+
+### 18.3 iOS no abre cámara/galería
+
+Acción:
+
+- Añadir descripciones `NSCameraUsageDescription` y `NSPhotoLibraryUsageDescription` en Info.plist.
+
+### 18.4 Persistencia no refleja cambios
+
+Acciones:
+
+- Borrar datos de app (solo en debug).
+- Revisar claves Hive (`settings:<correo>`, `user:<correo>`).
+- Confirmar que el correo coincide exactamente (case-sensitive).
+
+## 19. Roadmap y Mejoras Futuras (Propuesta)
+
+### 19.1 Arquitectura
+
+1. Separar `lib/` en módulos:
+   - `models/`
+   - `services/`
+   - `screens/`
+   - `widgets/`
+2. Introducir un gestor de estado:
+   - Riverpod o BLoC para desacoplar UI y persistencia.
+3. Introducir repositorios:
+   - `UserRepository`, `HydrationRepository`, etc.
+
+### 19.2 Persistencia
+
+1. Definir `TypeAdapter` de Hive para `User` y `UserSettings`.
+2. Versionar esquemas y migraciones explícitas.
+3. Cifrado de cajas sensibles.
+
+### 19.3 Notificaciones
+
+1. Implementar `flutter_local_notifications`.
+2. Programación persistente de recordatorios con canales Android.
+3. “Quiet hours” y configuración por usuario.
+
+### 19.4 Ejercicio
+
+1. Filtrado de ruido GPS.
+2. Calibración de longitud de paso por usuario.
+3. Integración con pedómetro / HealthKit / Google Fit (según plataforma).
+
+### 19.5 Sueño
+
+1. Integración con sensores y/o Health APIs.
+2. Mejor heurística: considerar movimiento y bloqueo de pantalla.
+3. Consolidación de schema en `daily_sleep`.
+
+### 19.6 Nutrición
+
+1. Cache de resultados por hash de imagen.
+2. Mejor parseo con JSON estructurado (solicitar a Gemini salida JSON).
+3. Modo offline parcial (biblioteca de alimentos básica).
+
+### 19.7 Generación de PDF (Diseño Propuesto)
+
+Estado:
+No implementado en el código actual.
+
+Objetivo propuesto:
+Exportar reportes semanales/mensuales de:
+
+- Hidratación (totales y cumplimiento).
+- Ejercicio (pasos/distancia).
+- Sueño (horas).
+- Nutrición (macros estimados).
+
+Diseño sugerido (ejemplo conceptual):
+
+```dart
+// Diseño propuesto (no existe en main.dart actual)
+Future<Uint8List> buildWeeklyReportPdf(WeeklyReport data) async {
+  // 1) Componer páginas con gráficos y tablas
+  // 2) Renderizar a bytes (pdf)
+  // 3) Retornar para compartir/guardar
+  throw UnimplementedError();
+}
+```
+
+## 20. Glosario
+
+- ARGB: representación de color con Alpha, Red, Green, Blue.
+- DTO: objeto de transferencia de datos (p. ej. SettingsData).
+- Hive Box: contenedor clave-valor persistente.
+- IndexedStack: widget que mantiene estados de hijos no visibles.
+- Material 3: sistema de diseño con color dinámico y componentes modernizados.
+- MIME: tipo de contenido (p. ej. `image/jpeg`).
+- Prompt: instrucción textual enviada a un modelo generativo.
+- Seed color: color semilla usado para derivar un ColorScheme.
+- Timestamp ms: milisegundos desde epoch (Unix).
+
+## 21. Licencia
+
+Este repositorio no incluye un archivo LICENSE explícito en la estructura observada. Para proyectos open-source se recomienda incorporar una licencia formal.
+
+Licencia sugerida (MIT, texto de referencia):
+
+Copyright (c) 2026
+
+Se concede permiso, de forma gratuita, a cualquier persona que obtenga una copia
+de este software y de los archivos de documentación asociados (el "Software"), para
+utilizar el Software sin restricción, incluyendo, sin limitación, los derechos
+de usar, copiar, modificar, fusionar, publicar, distribuir, sublicenciar y/o vender
+copias del Software, y para permitir a las personas a las que se les proporcione el Software
+hacer lo mismo, sujeto a las siguientes condiciones:
+
+El aviso de copyright anterior y este aviso de permiso se incluirán en todas
+las copias o partes sustanciales del Software.
+
+EL SOFTWARE SE PROPORCIONA "TAL CUAL", SIN GARANTÍA DE NINGÚN TIPO, EXPRESA O
+IMPLÍCITA, INCLUYENDO, PERO NO LIMITADO A, LAS GARANTÍAS DE COMERCIABILIDAD,
+IDONEIDAD PARA UN PROPÓSITO PARTICULAR Y NO INFRACCIÓN. EN NINGÚN CASO LOS
+AUTORES O TITULARES DE LOS DERECHOS DE AUTOR SERÁN RESPONSABLES POR CUALQUIER RECLAMO,
+DAÑOS U OTRA RESPONSABILIDAD, YA SEA EN UNA ACCIÓN DE CONTRATO, AGRAVIO O DE
+OTRA MANERA, QUE SURJA DE O EN CONEXIÓN CON EL SOFTWARE O EL USO U OTROS TRATOS
+EN EL SOFTWARE.
+
+## 22. Créditos
+
+### 22.1 Tecnologías y Librerías
+
+- Flutter y Dart (Google).
+- Hive (base de datos local).
+- Google Generative AI SDK (`google_generative_ai`).
+- Geolocator.
+- fl_chart.
+- image_picker.
+- path_provider.
+
+### 22.2 Atribuciones de Producto
+
+- “Vitu” se presenta como una aplicación integral de salud con enfoque educativo y de bienestar.
+- Los resultados de IA son aproximaciones y no sustituyen asesoramiento médico.
+
+## 23. Apéndice A: Convenciones de Claves Hive (Especificación)
+
+Esta especificación describe las convenciones reales usadas en el proyecto y su interpretación recomendada.
+
+### 23.1 Prefijos
+
+| Prefijo | Ejemplo | Caja | Significado |
+|---|---|---|---|
+| `user:` | `user:ana@ejemplo.com` | `users` | Registro del usuario |
+| `settings:` | `settings:ana@ejemplo.com` | `user_settings` | Preferencias del usuario |
+| `exercise_logs:` | `exercise_logs:ana@ejemplo.com` | `daily_exercise` | Historial de sesiones |
+
+### 23.2 Claves Diarias (YYYY-MM-DD)
+
+Formato:
+
+```text
+<correo>_<YYYY-MM-DD>
+```
+
+Ejemplos:
+
+```text
+ana@ejemplo.com_2026-03-14
+carlos@empresa.com_2026-12-01
+```
+
+Uso por caja:
+
+| Caja | Contenido bajo `<correo>_<date>` |
+|---|---|
+| `daily_exercise` | Resumen de pasos/distancia del día |
+| `hydration_logs` | Lista de eventos `{ts, ml}` del día |
+| `daily_hydration_summary` | Resumen `{totalMl, goalMl}` del día |
+| `daily_sleep` | Resumen de sueño del día |
+
+## 24. Apéndice B: Ejemplos de Datos Persistidos (JSON Conceptual)
+
+Los siguientes ejemplos están expresados en JSON conceptual para facilitar inspección. En Hive se almacenan como mapas/listas nativas de Dart.
+
+### 24.1 Usuario (`users` / `user:<correo>`)
+
+```json
+{
+  "nombre": "Ana",
+  "apellido": "Pérez",
+  "genero": "Femenino",
+  "edad": 29,
+  "altura": 1.65,
+  "peso": 62.5,
+  "correo": "ana@ejemplo.com",
+  "contrasena": "********",
+  "photoPath": "C:/.../profile_ana.jpg"
+}
+```
+
+### 24.2 Settings (`user_settings` / `settings:<correo>`)
+
+```json
+{
+  "userId": "ana@ejemplo.com",
+  "brightness": "dark",
+  "seedColor": 4286613962,
+  "fontFamily": "Poppins",
+  "language": "Español",
+  "followLocation": true,
+  "metaHydratationMl": 2200,
+  "shareAnonymous": false,
+  "pushEnabled": false,
+  "remindersEnabled": true,
+  "healthAlerts": false,
+  "locationPersonalized": false,
+  "highContrast": false,
+  "notificationFrequency": 2,
+  "textScale": 1.0
+}
+```
+
+### 24.3 Hidratación (`hydration_logs` / `<correo>_<date>`)
+
+```json
+[
+  { "ts": 1773500000000, "ml": 250 },
+  { "ts": 1773503600000, "ml": 300 }
+]
+```
+
+### 24.4 Resumen de Hidratación (`daily_hydration_summary` / `<correo>_<date>`)
+
+```json
+{
+  "date": "2026-03-14",
+  "totalMl": 550,
+  "goalMl": 2200,
+  "updatedAt": 1773507200000
+}
+```
+
+### 24.5 Sueño (`daily_sleep` / `<correo>_<date>`)
+
+```json
+{
+  "date": "2026-03-14",
+  "sleepHours": 6.5,
+  "manual": false,
+  "inactiveSegments": [
+    { "startTs": 1773460000000, "endTs": 1773480000000 }
+  ],
+  "updatedAt": 1773507200000
+}
+```
+
+## 25. Apéndice C: Diagramas (Mermaid)
+
+### 25.1 Flujo de Sesión
+
+```mermaid
+flowchart TD
+  A[Arranque app] --> B{Hive: currentUserEmail existe?}
+  B -- No --> C[LoginRegisterScreen]
+  B -- Sí --> D[HomeTabs]
+  C -->|Login OK| D
+  D --> E[HomeScreen Nutrición]
+  D --> F[ExerciseScreen]
+  D --> G[HydrationScreen]
+  D --> H[SleepScreen]
+  D --> I[SettingsScreen]
+  I -->|Guarda| J[user_settings: settings:<correo>]
+  C -->|Registra| K[users: user:<correo>]
+```
+
+### 25.2 Persistencia por Módulo
+
+```mermaid
+flowchart LR
+  U[User: user:<correo>] --> S[UserSettings: settings:<correo>]
+  U --> HLOG[hydration_logs: <correo>_<date>]
+  HLOG --> HSUM[daily_hydration_summary: <correo>_<date>]
+  U --> EX[daily_exercise: <correo>_<date>]
+  U --> SLP[daily_sleep: <correo>_<date>]
+```
+
+## 26. Apéndice D: Checklist de Release (Operativo)
+
+1. Eliminar credenciales hardcodeadas (API key de Gemini).
+2. Verificar permisos Android/iOS (ubicación, cámara/galería).
+3. Ejecutar análisis:
+   - `flutter analyze`
+4. Ejecutar tests:
+   - `flutter test`
+5. Validar build Android:
+   - `flutter build apk --release`
+6. Validar build iOS:
+   - `flutter build ios --release`
+7. Verificar persistencia Hive en ejecución real (instalación limpia).
+8. Revisar tamaño final y assets.
 
 - `gemini-2.5-flash` (texto + multimodal).
 
