@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "301028908007",
+    "project_id": "vitu-dd103",
+    "storage_bucket": "vitu-dd103.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:301028908007:android:d48455bf85b1968b537b42",
+        "android_client_info": {
+          "package_name": "com.example.flutter_application_1"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA2C8KbwLg7mH5Q0jx74xwFrF9f9lYdqK4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

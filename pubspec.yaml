@@ -1,4 +1,4 @@
-name: flutter_application_1
+name: vidasaludable
 description: "A new Flutter project."
 publish_to: 'none'
 
@@ -24,9 +24,13 @@ dependencies:
   # Reemplazado: activity_recognition_flutter eliminado por incompatibilidad AGP 8+
   # google_generative_ai: ^0.5.0
   google_generative_ai: ^0.4.0
-  hive: ^2.2.3
-  hive_flutter: ^1.1.0
   screen_state: 5.0.0
+  firebase_core: ^4.7.0
+  firebase_auth: ^6.1.0
+  cloud_firestore: ^6.3.0
+  connectivity_plus: ^6.1.0
+  flutter_local_notifications: ^19.0.0
+  timezone: ^0.10.1
   # Eliminado: pedometer (conteo de pasos por GPS)
 
 dev_dependencies:
